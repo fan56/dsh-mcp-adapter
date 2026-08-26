@@ -1,0 +1,27 @@
+# dsh-mcp-adapter bundle patch: mounts the prompt-side MCP folding shim
+# under the stable id `dsh-mcp-adapter`.
+#
+# It keeps the official @deepseek-ai/dsh-mcp-client plugin instances as the
+# connection layer (transports, reconnect, list_changed re-sync all stay
+# upstream), but folds every `mcp__<server>__<tool>` schema out of each
+# assembled prompt and exposes two constant meta-tools (`mcp_list` /
+# `mcp_call`) instead — the model expands schemas on demand, so standing
+# prompt cost is O(1) in the number of MCP servers and tools.
+#
+# Load order does not matter: folding happens per prompt assembly, and the
+# adapter degrades to official passthrough when its own meta-tools are not
+# registered. List it next to your dsh-mcp-client lines for clarity. Under
+# Code Mode the wire already collapses to `run_code`, so this plugin is a
+# no-op there.
+#
+# Config (all optional):
+#   prefix:             tool-name prefix to fold (default "mcp__")
+#   keep:               name patterns ("*" wildcard) kept native, e.g.
+#                       ["mcp__fs__read_file", "mcp__github__*"]
+#   descriptionLimit:   max chars per tool description in the mcp_list
+#                       catalog (default 200)
+
+- insert:
+    - id: dsh-mcp-adapter
+      name: '@aiwayds/dsh-mcp-adapter'
+      config: {}
