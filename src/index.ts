@@ -10,15 +10,26 @@
  * - every prefix-matching tool schema is folded out of the assembled prompt
  *   (`system-prompt/assemble` waterfall), so standing prompt cost is O(1) in
  *   the number of servers and tools, and the tool list stays KV-prefix
- *   stable across server re-syncs;
+ *   stable across server re-syncs. The prefix is a naming convention, not a
+ *   trust boundary — third-party tools that happen to use it fold too; set
+ *   `servers` to restrict folding (and cataloging/dispatch) to named servers;
  * - two constant meta-tools replace them:
  *   - `mcp_list` — compact catalog grouped by server; `tool` expands one
  *     full schema on demand, `server` filters, `verbose` inlines everything;
  *   - `mcp_call` — dispatches `{ tool, arguments }` to the still-registered
  *     definition, forwarding the run context.
  *
- * Tools stay registered in `ctx.tools`, so TUI rendering, `tools.restrict()`
- * masking, and guards keep working — only the prompt payload changes.
+ * Tools stay registered in `ctx.tools`, so TUI rendering and
+ * `tools.restrict()` masking keep working — only the prompt payload changes.
+ * Pipeline nuance: pre-execute/guard/post-execute stages that match by the
+ * child tool's name never fire for folded calls (the registry only sees the
+ * outer `mcp_call`) — gate MCP usage by guarding `mcp_call` itself.
+ *
+ * Child-owned projections are preserved: `mcp_call` delegates its
+ * `output.render` to the dispatched child and forwards the child's
+ * `finalizeContent` with the exact same run-execution object, so
+ * image-bearing MCP results still project to durable attachment references
+ * instead of inlining base64 into the context.
  *
  * Fail-open: unless BOTH meta-tools resolve (in the assembling scope) to
  * exactly this plugin's definitions, assemblies pass through untouched — a
@@ -34,7 +45,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { ContentBlock, ToolSchema } from '@deepseek-ai/dsh-llm'
-import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
+import type { ToolDefinition, ToolExecution, ToolExecutionResult, JsonValue } from '@deepseek-ai/dsh-tools'
 import type { ScopeKey } from '@deepseek-ai/dsh-scope'
 // Side-effect type imports: declaration-merge the `tools` service onto
 // Context and the `system-prompt/assemble` waterfall onto Events.
@@ -70,6 +81,13 @@ export interface AdapterConfig {
   prefix: string
   /** Name patterns ("*" wildcard) kept native in the prompt. */
   keep: string[]
+  /**
+   * Server-name whitelist. Empty (default) folds every prefix-matching tool —
+   * the prefix is then a naming convention, not a trust boundary. Non-empty
+   * folds/catalogs/dispatches ONLY tools of the listed servers; fold, catalog
+   * and dispatch all consult the same list.
+   */
+  servers: string[]
   /** Max chars per tool description in the mcp_list catalog. */
   descriptionLimit: number
 }
@@ -77,6 +95,7 @@ export interface AdapterConfig {
 export const Config = z.object({
   prefix: z.string().pattern(PREFIX_PATTERN).default(DEFAULT_PREFIX),
   keep: z.array(String).default([]),
+  servers: z.array(String).default([]),
   descriptionLimit: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_DESCRIPTION_LIMIT),
 }) as unknown as z<AdapterConfig>
 
@@ -114,18 +133,41 @@ export function matchesKeep(name: string, patterns: readonly string[]): boolean 
 }
 
 /**
+ * Whether the server segment of one prefix-matching tool name passes the
+ * optional servers whitelist. An empty list admits every server (the prefix
+ * is a naming convention, not a trust boundary); a non-empty list admits
+ * only the named servers.
+ * @param name - the registered tool name.
+ * @param prefix - the configured MCP prefix.
+ * @param servers - server-name whitelist from config.
+ * @returns whether the tool's server is admitted.
+ */
+export function isAllowedServer(name: string, prefix: string, servers: readonly string[]): boolean {
+  if (servers.length === 0) return true
+  return servers.includes(serverOfToolName(name, prefix))
+}
+
+/**
  * Whether one tool's schema should be folded out of the prompt: it must
- * carry the configured prefix, not match the keep list — and it must never
- * be one of this plugin's own meta-tools, whatever the prefix is configured
- * to (folding them would make every folded MCP tool undiscoverable).
+ * carry the configured prefix, belong to a whitelisted server, not match the
+ * keep list — and it must never be one of this plugin's own meta-tools,
+ * whatever the prefix is configured to (folding them would make every folded
+ * MCP tool undiscoverable).
  * @param name - the registered tool name.
  * @param prefix - tool-name prefix to fold.
  * @param keep - keep patterns from config.
+ * @param servers - server-name whitelist from config (default: no filtering).
  * @returns whether the schema leaves the prompt (the tool stays callable).
  */
-export function shouldFold(name: string, prefix: string, keep: readonly string[]): boolean {
+export function shouldFold(
+  name: string,
+  prefix: string,
+  keep: readonly string[],
+  servers: readonly string[] = [],
+): boolean {
   if (name === MCP_LIST_TOOL_NAME || name === MCP_CALL_TOOL_NAME) return false
   return prefix !== '' && name.startsWith(prefix) && !matchesKeep(name, keep)
+    && isAllowedServer(name, prefix, servers)
 }
 
 // ---- Assembly folding (pure) ----
@@ -136,6 +178,8 @@ export interface FoldOptions {
   prefix: string
   /** Name patterns kept native. */
   keep: readonly string[]
+  /** Server-name whitelist; empty or omitted admits every server. */
+  servers?: readonly string[]
 }
 
 /**
@@ -170,7 +214,10 @@ export function foldPromptAssembly<T extends AssemblyWithTools>(
   metaToolsLive: boolean,
 ): T {
   if (!metaToolsLive) return assembly
-  const tools = assembly.tools.filter(tool => !shouldFold(tool.name, options.prefix, options.keep))
+  const servers = options.servers ?? []
+  const tools = assembly.tools.filter(
+    tool => !shouldFold(tool.name, options.prefix, options.keep, servers),
+  )
   if (tools.length === assembly.tools.length) return assembly
   return { ...assembly, tools }
 }
@@ -183,6 +230,8 @@ export interface McpListOptions {
   prefix: string
   /** Max chars per tool description in the catalog. */
   descriptionLimit: number
+  /** Server-name whitelist; empty or omitted admits every server. */
+  servers?: readonly string[]
 }
 
 /** Normalized `mcp_list` arguments. */
@@ -245,14 +294,21 @@ export function serverOfToolName(name: string, prefix: string): string {
 
 /**
  * Truncate one description to the catalog limit, marking the cut with an
- * ellipsis character (so one char of headroom is reserved).
+ * ellipsis character (so one char of headroom is reserved). A cut that would
+ * land on the LOW half of a surrogate pair backs off one code unit so no
+ * orphaned high surrogate is emitted.
  * @param text - the full tool description.
  * @param limit - max chars in the catalog.
  * @returns the truncated description.
  */
 export function truncateDescription(text: string, limit: number): string {
   if (text.length <= limit) return text
-  return `${text.slice(0, Math.max(0, limit - 1))}…`
+  let end = Math.max(0, limit - 1)
+  // slice(0, end) excludes text[end]: when that first excluded code unit is
+  // a low surrogate, the last included one is its now-orphaned high half.
+  const cut = text.charCodeAt(end)
+  if (cut >= 0xDC00 && cut <= 0xDFFF && end > 0) end -= 1
+  return `${text.slice(0, end)}…`
 }
 
 /**
@@ -274,9 +330,19 @@ export function buildMcpListResult(
   options: McpListOptions,
 ): McpListResult {
   const { prefix, descriptionLimit } = options
+  const servers = options.servers ?? []
   if (args.tool !== undefined) {
+    // The meta-tools are visible schemas like any other and can match a
+    // pathological prefix (e.g. "mcp_") — never expand them; they are this
+    // adapter's own surface, not MCP tools.
+    if (args.tool === MCP_LIST_TOOL_NAME || args.tool === MCP_CALL_TOOL_NAME) {
+      return { error: `refusing to expand "${args.tool}": meta-tools are not expandable through ${MCP_LIST_TOOL_NAME}` }
+    }
     if (!args.tool.startsWith(prefix)) {
       return { error: `"${args.tool}" is not an MCP tool (expected the "${prefix}" prefix) — call ${MCP_LIST_TOOL_NAME} without arguments for the catalog` }
+    }
+    if (!isAllowedServer(args.tool, prefix, servers)) {
+      return { error: `"${args.tool}" belongs to server "${serverOfToolName(args.tool, prefix)}", which is not in the configured servers list` }
     }
     const schema = schemas.find(candidate => candidate.name === args.tool)
     if (schema === undefined) {
@@ -285,15 +351,19 @@ export function buildMcpListResult(
     // On-demand expansion: the FULL description and schema, not truncated.
     return { tool: { name: schema.name, description: schema.description, parameters: schema.parameters } }
   }
-  const servers: CatalogServerEntry[] = []
+  const serversOut: CatalogServerEntry[] = []
   for (const schema of schemas) {
+    // Never catalog the meta-tools themselves, even under a prefix that
+    // matches their names.
+    if (schema.name === MCP_LIST_TOOL_NAME || schema.name === MCP_CALL_TOOL_NAME) continue
     if (!schema.name.startsWith(prefix)) continue
+    if (!isAllowedServer(schema.name, prefix, servers)) continue
     const server = serverOfToolName(schema.name, prefix)
     if (args.server !== undefined && server !== args.server) continue
-    let group = servers.find(entry => entry.server === server)
+    let group = serversOut.find(entry => entry.server === server)
     if (group === undefined) {
       group = { server, tools: [] }
-      servers.push(group)
+      serversOut.push(group)
     }
     group.tools.push({
       name: schema.name,
@@ -301,12 +371,12 @@ export function buildMcpListResult(
       ...args.verbose === true ? { parameters: schema.parameters } : {},
     })
   }
-  if (servers.length === 0) {
+  if (serversOut.length === 0) {
     return args.server === undefined
       ? { error: `no MCP tools are registered under the "${prefix}" prefix` }
       : { error: `no MCP tools match server "${args.server}"` }
   }
-  return { servers }
+  return { servers: serversOut }
 }
 
 // ---- Dispatch (mcp_call, pure) ----
@@ -323,7 +393,8 @@ export interface DispatchableTool<E> {
  * Dispatch one `mcp_call` to the resolved child tool.
  *
  * Validation: `tool` must be a non-empty string matching the configured
- * prefix, must not name a meta-tool, and must resolve through `resolve`
+ * prefix, must not name a meta-tool, must belong to a whitelisted server
+ * (when `servers` is non-empty), and must resolve through `resolve`
  * (scope-aware — a restricted-away tool does not resolve, so whitelists are
  * respected naturally). Non-MCP tools are REFUSED outright: dispatching them
  * here would bypass their own pre-execute pipeline (guards, approvals).
@@ -348,6 +419,7 @@ export interface DispatchableTool<E> {
  * @param prefix - the configured MCP prefix.
  * @param resolve - scope-aware tool resolver (production: `ctx.tools.get`).
  * @param exec - the meta-tool's run context, forwarded to the child.
+ * @param servers - server-name whitelist (default: no filtering).
  * @returns the child's resolved value verbatim, or a structured error.
  */
 export async function dispatchMcpCall<E>(
@@ -355,6 +427,7 @@ export async function dispatchMcpCall<E>(
   prefix: string,
   resolve: (name: string) => DispatchableTool<E> | undefined,
   exec: E,
+  servers: readonly string[] = [],
 ): Promise<unknown> {
   if (typeof args !== 'object' || args === null || Array.isArray(args)) {
     return { error: `${MCP_CALL_TOOL_NAME} expects an object { "tool": string, "arguments"?: object }` }
@@ -369,6 +442,9 @@ export async function dispatchMcpCall<E>(
   }
   if (tool === MCP_LIST_TOOL_NAME || tool === MCP_CALL_TOOL_NAME) {
     return { error: `refusing to call "${tool}": meta-tools are not dispatchable through ${MCP_CALL_TOOL_NAME}` }
+  }
+  if (!isAllowedServer(tool, prefix, servers)) {
+    return { error: `refusing to call "${tool}": server "${serverOfToolName(tool, prefix)}" is not in the configured servers list` }
   }
   const definition = resolve(tool)
   if (definition === undefined) {
@@ -414,17 +490,130 @@ async function raceToolTimeout<E>(
 // ---- Meta-tool definitions (factories; Cordis-free) ----
 
 /**
+ * Whether a value is this plugin's structured-error wrap (single `error`
+ * string key) — rendered as plain text, never delegated to a child.
+ */
+function isStructuredError(value: unknown): value is { error: string } {
+  return typeof value === 'object' && value !== null
+    && Object.keys(value).length === 1
+    && typeof (value as { error?: unknown }).error === 'string'
+}
+
+/**
  * Render a canonical meta-tool value as model-facing text: structured
  * errors read best plain, everything else round-trips as pretty JSON.
  */
 function renderValue(value: unknown): ContentBlock[] {
-  if (typeof value === 'object' && value !== null
-    && Object.keys(value).length === 1
-    && typeof (value as { error?: unknown }).error === 'string') {
-    return [{ type: 'text', text: (value as { error: string }).error }]
+  if (isStructuredError(value)) {
+    return [{ type: 'text', text: value.error }]
   }
   const text = JSON.stringify(value, null, 2)
   return [{ type: 'text', text: text === undefined ? '(no JSON result)' : text }]
+}
+
+/** Parse the child tool name out of one mcp_call argument object. */
+function childToolName(args: unknown): string | undefined {
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) return undefined
+  const tool = (args as { tool?: unknown }).tool
+  return typeof tool === 'string' && tool !== '' ? tool : undefined
+}
+
+/**
+ * Extract the arguments payload mcp_call forwards (or would forward) to the
+ * child — the exact `?? {}` fallback {@link dispatchMcpCall} applies.
+ */
+function childArguments(args: unknown): unknown {
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) return {}
+  return (args as { arguments?: unknown }).arguments ?? {}
+}
+
+/**
+ * Render one mcp_call outcome by delegating to the dispatched child's own
+ * `output.render`, so model-facing text is exactly what a native call of the
+ * child would produce. Falls back to the generic JSON rendering whenever the
+ * value is this plugin's structured-error wrap, the child cannot be resolved
+ * from the arguments, or the child's render throws (the value's shape is the
+ * child's contract, not this tool's).
+ * @param metaArgs - the frozen mcp_call arguments (`{ tool, arguments? }`).
+ * @param value - the dispatched child's resolved value (or an error wrap).
+ * @param resolveChild - definition resolver (unscoped view is fine here —
+ *   render is a pure display projection).
+ * @returns the model-facing content blocks.
+ */
+export function renderDispatched(
+  metaArgs: unknown,
+  value: unknown,
+  resolveChild: (name: string) => ToolDefinition | undefined,
+): ContentBlock[] {
+  if (isStructuredError(value)) return renderValue(value)
+  const name = childToolName(metaArgs)
+  if (name === undefined) return renderValue(value)
+  const child = resolveChild(name)
+  if (child === undefined) return renderValue(value)
+  try {
+    return child.output.render(childArguments(metaArgs), value as JsonValue)
+  } catch {
+    return renderValue(value)
+  }
+}
+
+/**
+ * Forward one successful mcp_call outcome to the dispatched child's own
+ * `finalizeContent`, restoring child-owned rich projections (image
+ * attachments).
+ *
+ * Why this is needed: the official mcp-client stages image projections in a
+ * `WeakMap<ToolExecution, PreparedProjection>` filled by its executor
+ * (`packages/mcp/mcp-client/src/tools.ts:255`, `:354-358`) and hands them
+ * back from `finalizeContent` (`:262-270`) — but the registry invokes
+ * `finalizeContent` only for the OUTER executed definition
+ * (`packages/core/tools/src/index.ts:1649-1654`), which here is `mcp_call`.
+ * Without forwarding, the child's projection never runs and image results
+ * degrade to their base64-in-text fallback.
+ *
+ * Mechanics: the child is re-resolved from `metaArgs.tool`; a child-view
+ * success result is synthesized with `content` computed by the child's own
+ * `output.render` (the same fallback the registry would have produced for a
+ * native call, so the child's value/fallback equality guards still pass);
+ * and the child's `finalizeContent` is invoked with the EXACT `exec` object
+ * dispatch forwarded to `child.execute` — same object identity, so the
+ * child's WeakMap lookup hits.
+ *
+ * Failure paths never project: an `isError` result and this plugin's
+ * structured-error wraps return `undefined` immediately; a child without
+ * `finalizeContent`, an unresolvable child, or a throwing child callback
+ * (the contract demands total callbacks) also degrade to `undefined`, which
+ * preserves the registry-computed content.
+ *
+ * @param metaArgs - the frozen mcp_call arguments (`{ tool, arguments? }`).
+ * @param result - the registry-normalized mcp_call outcome.
+ * @param exec - the mcp_call execution object that was forwarded verbatim
+ *   to the child body — the child's projection WeakMap key.
+ * @param resolveChild - scope-aware definition resolver.
+ * @returns replacement content from the child's finalizer, or `undefined`
+ *   to preserve the registry-computed content.
+ */
+export function delegateFinalizeContent(
+  metaArgs: unknown,
+  result: Readonly<ToolExecutionResult>,
+  exec: Readonly<ToolExecution>,
+  resolveChild: (name: string) => ToolDefinition | undefined,
+): ContentBlock[] | undefined {
+  try {
+    if (result.isError) return undefined
+    if (isStructuredError(result.value)) return undefined
+    const name = childToolName(metaArgs)
+    if (name === undefined) return undefined
+    const child = resolveChild(name)
+    if (child === undefined || child.finalizeContent === undefined) return undefined
+    // The registry renders result.content through mcp_call's output.render,
+    // which delegates to this same child render — recompute it here so the
+    // child sees the identical fallback a native call would have produced.
+    const fallback = child.output.render(childArguments(metaArgs), result.value)
+    return child.finalizeContent(exec, { isError: false, value: result.value, content: fallback })
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -485,11 +674,13 @@ export function createMcpListTool(
  * @param prefix - the configured MCP prefix (dispatch boundary).
  * @param resolve - scope-aware definition resolver (production:
  *   `ctx.tools.get`, called with the calling agent).
+ * @param servers - server-name whitelist (default: no filtering).
  * @returns the complete tool definition.
  */
 export function createMcpCallTool(
   prefix: string,
   resolve: (name: string, scope?: ScopeKey) => ToolDefinition | undefined,
+  servers: readonly string[] = [],
 ): ToolDefinition {
   return {
     name: MCP_CALL_TOOL_NAME,
@@ -512,12 +703,19 @@ export function createMcpCallTool(
     output: {
       // Permissive on purpose: the canonical value is the child tool's own
       // resolved value (or a structured { error }); its shape is the child's
-      // contract, not this tool's.
+      // contract, not this tool's. Rendering delegates to the dispatched
+      // child's own output.render so text output matches a native call.
       schema: {},
-      render: (_args: unknown, value: unknown) => renderValue(value),
+      render: (args: unknown, value: unknown) =>
+        renderDispatched(args, value, name => resolve(name)),
     },
     execute: (args: unknown, exec) =>
-      dispatchMcpCall(args, prefix, name => resolve(name, exec.agent), exec),
+      dispatchMcpCall(args, prefix, name => resolve(name, exec.agent), exec, servers),
+    // Restore child-owned projections (image attachments): the registry
+    // invokes THIS definition's finalizer, so it must forward to the child's
+    // with the same exec object dispatch passed to child.execute.
+    finalizeContent: (exec, result) =>
+      delegateFinalizeContent(exec.arguments, result, exec, name => resolve(name, exec.agent)),
   }
 }
 
@@ -534,14 +732,23 @@ export function createMcpCallTool(
  * @param config - resolved adapter configuration.
  */
 export function apply(ctx: Context, config: AdapterConfig): void {
-  const foldOptions: FoldOptions = { prefix: config.prefix, keep: config.keep }
+  const foldOptions: FoldOptions = {
+    prefix: config.prefix,
+    keep: config.keep,
+    servers: config.servers,
+  }
   const listOptions: McpListOptions = {
     prefix: config.prefix,
     descriptionLimit: config.descriptionLimit,
+    servers: config.servers,
   }
 
   const listDefinition = createMcpListTool(listOptions, scope => ctx.tools.schemas(scope))
-  const callDefinition = createMcpCallTool(config.prefix, (name, scope) => ctx.tools.get(name, scope))
+  const callDefinition = createMcpCallTool(
+    config.prefix,
+    (name, scope) => ctx.tools.get(name, scope),
+    config.servers,
+  )
 
   const disposers: Array<() => void> = []
   try {

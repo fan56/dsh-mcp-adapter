@@ -54,8 +54,21 @@ dsh 上游现状（已核实，`~/github/deepseek-harness`）：
   上下文，完整 schema 只在模型点名 `tool` 或 `verbose` 时进。
 - **KV cache 友好**：折叠后 tools 列表恒定（不随 re-sync 换代变化），
   比官方模式更 prefix-stable。
-- **行为不丢失**：工具照常注册（TUI 展示、restrict、guard 不受影响），
-  只是 schema 不再进 prompt。
+- **行为不丢失**：工具照常注册（TUI 展示、`tools.restrict()` 不受影
+  响），只是 schema 不再进 prompt。⚠️ 管线细节：按**子工具名**匹配的
+  pre-execute/guard/post-execute 阶段只会看到外层 `mcp_call`（registry
+  只对被执行的外层定义调用这些阶段）；要管 MCP 权限应 guard
+  `mcp_call` 本身。
+- **图片投影保留**：官方 mcp-client 的图片结果投影
+  （`WeakMap<ToolExecution, projection>` + `finalizeContent`，见
+  `packages/mcp/mcp-client/src/tools.ts:255-270`）经 mcp_call 的
+  **finalizeContent 委托**恢复——mcp_call 把 child 视角的 result（content
+  用 child.output.render 现算 fallback）转发给
+  `child.finalizeContent(exec, result)`，`exec` 与透传给 child.execute 的
+  是同一个对象，WeakMap 按身份命中。`mcp_call.output.render` 同样委托
+  child.output.render，模型可见文本与原生调用一致。失败路径
+  （isError / 结构化 { error } wrap / child 无 finalizeContent / child
+  回调抛错）一律返回 undefined 走 registry 默认内容，绝不投影。
 
 ## 3. Meta-tool 契约
 
@@ -65,32 +78,60 @@ args：`{ tool?: string, server?: string, verbose?: boolean }`
 
 - 无参：返回紧凑目录 `{ servers: [{ server, tools: [{ name, description }] }] }`
   ——name 为注册全名（`mcp__<server>__<tool>`），description 按
-  `descriptionLimit`（默认 200）截断，**不含 schema**。
+  `descriptionLimit`（默认 200）截断（切割点落在代理对低位时回退 1，
+  不产生孤立代理项），**不含 schema**。
+- **meta-tool 自身永不入目录/不可点名展开**：目录循环与 `tool` 展开两
+  条路径都排除 `mcp_list`/`mcp_call`（病态 prefix 如 `mcp_` 会匹配它们
+  的名字），展开时返回与 dispatch 同风格的
+  `refusing to expand "..."` 结构化错误。
 - `tool`（优先级最高）：返回 `{ tool: { name, description, parameters } }`
   完整 schema（按需展开）。
 - `server`：按 server 过滤目录。server 名取
   `name.slice(prefix.length).split('__')[0]`（启发式：serverName 规范
   `[A-Za-z0-9_-]{1,32}`，双下划线分段——在 README 记录该启发式）。
 - `verbose: true`：目录内联全部 schema（模型明确要求时才付这个 token）。
-- 未知 `tool` / 空结果：返回结构化错误信息（不 throw）。
+- 未知 `tool` / 空结果 / server 不在 `servers` 白名单：返回结构化错误
+  信息（不 throw）。
 
 ### mcp_call
 
 args：`{ tool: string, arguments?: object }`
 
-- 校验：`tool` 必须匹配 `prefix` **且**能被 `ctx.tools.get(tool)` 解析
-  （restricted-away 的工具 get 不到，天然尊重白名单）。**绝不允许**
-  通过 mcp_call 调非 mcp 工具——那会绕过子工具自己的 pre-execute 管线。
+- 校验：`tool` 必须匹配 `prefix`、不得是两个 meta-tool 名、（`servers`
+  非空时）`serverOfToolName(tool)` 必须在白名单内，且能被
+  `ctx.tools.get(tool)` 解析（restricted-away 的工具 get 不到，天然尊
+  重白名单）。**绝不允许**通过 mcp_call 调非 mcp 工具——那会绕过子工
+  具自己的 pre-execute 管线。
 - 分发：`definition.execute(args.arguments ?? {}, exec)`，`exec` 透传
-  meta-tool 自己的 ToolRunContext（signal/abort 语义正确传播）。
-  参照 `packages/core/tools/src/index.ts:404-421`（ToolRunContext）与
-  `packages/mcp/mcp-client/src/tools.ts:303-361`（官方 execute 闭包消费
-  了 exec 的哪些字段——照它的实际消费面透传，别猜）。
+  meta-tool 自己的 ToolRunContext（signal/abort 语义正确传播；identity
+  不变——这是 finalizeContent 委托能命中 child WeakMap 的前提）。
+  非对象 `arguments`（模型失手输出的裸 string 等）原样透传，coerce 留
+  给官方 executor（`packages/mcp/mcp-client/src/tools.ts:315-319` 同款
+  行为）；null/缺失走 `?? {}`。
+- 输出投影：`mcp_call.output.render` 委托
+  `child.output.render(childArgs, value)`（child 名与 childArgs 从
+  mcp_call 自己的 args 纯解析）；child 不可解析、render 抛错或值为
+  `{ error }` wrap 时回退 JSON 渲染。
+- finalizeContent 委托（图片投影恢复，见 §2）：成功结果时转发
+  `child.finalizeContent?.(exec, childResult)`；`exec` 是分发时透传的同
+  一对象。契约依据：registry 只对**被执行的外层定义**调用
+  finalizeContent（`packages/core/tools/src/index.ts:1649-1654`，
+  `:1398-1410` 快照时机），官方 mcp-client 的投影在
+  `packages/mcp/mcp-client/src/tools.ts:255`（WeakMap）与 `:262-270`
+  （finalizeContent 交还投影）之间按 exec 身份闭环。
 - timeout：若 `definition.timeoutMs` 存在，在分发处 race 一个 timer
-  （官方闭包内可能已自带 timeout——**实现前先读 tools.ts 确认**，避免
-  双重 timeout；若官方已处理则不叠加）。
+  （官方闭包内已自带 timeout，不叠加）。
 - 结果：原样返回子工具 execute 的 resolve 值；子工具 reject 则把
   message 包进结构化错误返回（不 throw，让模型可自我纠正）。
+
+### 信任边界（servers 白名单）
+
+prefix 是命名约定不是边界：第三方原生注册的 `mcp__*` 也会被折叠+分发。
+可选配置 `servers: string[]`（default `[]` = 不过滤）：非空时，只有
+`serverOfToolName(name, prefix) ∈ servers` 的工具才**折叠/进目录/可分
+发**，三处口径一致（`shouldFold` / `buildMcpListResult` /
+`dispatchMcpCall` 共用 `isAllowedServer`）。白名单外的工具保持原生注册
++原生进 prompt，可直接原生调用，但不经 meta-tool。
 
 ### 失败安全（fail-open）
 
@@ -104,12 +145,22 @@ args：`{ tool: string, arguments?: object }`
 `packages/core/tools/src/index.ts:994-999`），assembly.tools 里没有
 `mcp__*`，本插件自然 no-op。无需特殊处理，README 说明即可。
 
+### 已知边界
+
+- **waterfall 次序**：早于本插件注册的 assemble listener 若在 `next()`
+  之后补 `mcp__*` schema，会逃过折叠（本插件折叠的是自己 listener 运行
+  时 assembly 的最终内容）。今天上游无此类 listener，属已知边界。
+- **加载位置假设**：经 host 组合（cordis.patch.yml `insert`）加载时
+  listener 挂在 host 级 ctx 上，全局生效；若经 agent ctx 加载则只影响
+  该 agent 的 assembly。
+
 ## 4. 配置（schemastery）
 
 ```ts
 export interface AdapterConfig {
   /** tool-name prefix to fold */          prefix: string           // default 'mcp__'
   /** patterns kept native ("*" glob) */   keep: string[]           // default []
+  /** server whitelist (empty = no filter) */ servers: string[]     // default []
   /** catalog description truncation */    descriptionLimit: number // default 200
 }
 ```
@@ -119,6 +170,7 @@ export interface AdapterConfig {
 - `keep` 匹配：`*` 通配（转成 `.*` 全匹配 regex，锚定首尾），无通配符
   即精确名。keep 里的工具保持原生注册+原生进 prompt（对应
   pi-mcp-adapter 的 direct 模式）。
+- `servers` 语义见 §3「信任边界」。
 
 ## 5. 插件形状
 
@@ -156,12 +208,19 @@ export interface AdapterConfig {
     meta-tool 未注册时 fail-open 不改写、assembly 其余字段
     （sections/contexts/variables）不动。
   - keep 匹配：`*` glob、精确名、不匹配。
-  - 目录构建：分组、description 截断、server 过滤、tool 点名展开、
-    verbose、未知 tool 报错。
-  - mcp_call 校验：非 prefix 工具拒绝、get 不到拒绝、arguments 透传、
-    子工具异常包装。
+  - 目录构建：分组、description 截断（含代理对不劈开）、server 过滤、
+    tool 点名展开、verbose、未知 tool 报错、病态 prefix 下 meta-tool
+    自身不入目录/不可展开。
+  - mcp_call 校验：非 prefix 工具拒绝、get 不到拒绝、arguments 透传
+    （对象/非对象/null）、子工具异常包装。
+  - 图片投影委托：fake child（WeakMap 投影 + output.render）断言
+    exec 身份命中、成功转发、失败/错误 wrap/无 finalizer 不转发；
+    render 委托与回退。
+  - servers 白名单：折叠/目录/分发三处口径一致。
+  - apply() 冒烟：手写 stub ctx——注册成功→listener 改写 assembly、
+    effect teardown 注销；register 抛错→回滚、warn、不装 listener。
 - README：机制说明、配置表、与官方 client/Code Mode/dsh-mcp-proxy 的
-  共存关系、token 账（定性，不编数字）。
+  共存关系、token 账（定性，不编数字）、信任边界与已知边界。
 
 ## 8. 关键上游参考（实现前必读）
 

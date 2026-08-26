@@ -18,6 +18,12 @@
 #   prefix:             tool-name prefix to fold (default "mcp__")
 #   keep:               name patterns ("*" wildcard) kept native, e.g.
 #                       ["mcp__fs__read_file", "mcp__github__*"]
+#   servers:            server-name whitelist; when non-empty only these
+#                       servers' tools are folded/cataloged/dispatchable
+#                       (default [] = every prefix-matching tool; the
+#                       prefix alone is a naming convention, not a trust
+#                       boundary — list servers to trust only the official
+#                       client's registrations)
 #   descriptionLimit:   max chars per tool description in the mcp_list
 #                       catalog (default 200)
 
