@@ -81,6 +81,12 @@ config:
 - Coexists with [ben7am1n/dsh-mcp-proxy](https://github.com/ben7am1n/dsh-mcp-proxy) (connection-side proxy with its own servers — different, non-colliding tool names). That project credits pi-mcp-adapter as prior art too; this repo is an independent prompt-side take that reuses the official client instead of re-implementing connections.
 - Trade-offs (same as pi-mcp-adapter): one extra discovery round-trip before the first call, and expanded schemas still occupy context once the model pulls them in.
 
+## Acknowledgments
+
+With full credit to **[pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter)** by [@nicobailon](https://github.com/nicobailon): the core idea behind this plugin — collapsing an unbounded MCP tool surface into constant meta-tools whose schemas expand on demand, so the standing prompt cost stays O(1) no matter how many servers you run — is entirely theirs, and it reframed what MCP integration should cost. This repository is our port of that idea to DeepSeek Harness; the prompt-side-shim mechanism differs (by design), but the inspiration and the concept belong to the original. If you are on pi, go use theirs.
+
+Also inspired-by-adjacent: [ben7am1n/dsh-mcp-proxy](https://github.com/ben7am1n/dsh-mcp-proxy) independently validated the same demand for dsh.
+
 ## Development
 
 ```

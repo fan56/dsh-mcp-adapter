@@ -73,6 +73,12 @@ config:
 - 与 [ben7am1n/dsh-mcp-proxy](https://github.com/ben7am1n/dsh-mcp-proxy) 可共存（它是 connection-side 代理、自带连接管理，工具名互不冲突）。该项目同样致谢 pi-mcp-adapter；本仓库是独立的 prompt-side 实现：复用官方 client 而不是重造连接层。
 - 权衡（与 pi-mcp-adapter 相同）：首次调用多一次发现往返；模型展开过的 schema 会占据后续上下文。
 
+## 致谢
+
+特别致敬 **[pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter)** 及其作者 [@nicobailon](https://github.com/nicobailon)：本插件的核心思想——把无界的 MCP 工具面折叠为恒定的 meta-tool、schema 按需展开，从而无论挂多少 server 常驻 prompt 成本都是 O(1)——完全来自该项目；正是它重新定义了 MCP 集成应有的代价。本仓库是这个理念在 DeepSeek Harness 上的移植，机制上刻意走了不同的路线（复用官方连接层的 prompt-side shim），但灵感与理念的功劳归于原作。如果你用的是 pi，请直接用原版。
+
+同样值得提及：[ben7am1n/dsh-mcp-proxy](https://github.com/ben7am1n/dsh-mcp-proxy) 独立验证了 dsh 侧对这类方案的真实需求。
+
 ## 开发
 
 ```
