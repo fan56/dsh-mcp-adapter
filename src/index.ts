@@ -87,6 +87,14 @@ export const MCP_COMMAND_NAME = 'mcp'
 /** Max rendered lines of any /mcp output before truncation kicks in. */
 export const MCP_OUTPUT_LINE_LIMIT = 400
 
+/**
+ * Description cap for TREE views (`/mcp` overview and server listing): keep
+ * each tool to one readable line. The configurable `descriptionLimit`
+ * remains the ceiling for catalog-shaped data (`mcp_list`, `/mcp config`);
+ * full multi-paragraph descriptions belong in `/mcp list <tool>` detail.
+ */
+export const TREE_DESCRIPTION_LIMIT = 100
+
 /** Registered name of the catalog meta-tool. */
 export const MCP_LIST_TOOL_NAME = 'mcp_list'
 
@@ -520,19 +528,25 @@ export function serverOfToolName(name: string, prefix: string): string {
  * Truncate one description to the catalog limit, marking the cut with an
  * ellipsis character (so one char of headroom is reserved). A cut that would
  * land on the LOW half of a surrogate pair backs off one code unit so no
- * orphaned high surrogate is emitted.
+ * orphaned high surrogate is emitted. Whitespace runs (newlines, indents)
+ * are collapsed to single spaces FIRST — MCP vendors routinely ship
+ * multi-paragraph usage guides as descriptions and catalog lines must stay
+ * single-line.
  * @param text - the full tool description.
  * @param limit - max chars in the catalog.
- * @returns the truncated description.
+ * @returns the single-line truncated description.
  */
 export function truncateDescription(text: string, limit: number): string {
-  if (text.length <= limit) return text
+  // Collapse whitespace runs FIRST: MCP vendors routinely ship multi-paragraph
+  // usage guides as descriptions, and catalog lines must stay single-line.
+  const flat = text.replace(/\s+/gu, ' ').trim()
+  if (flat.length <= limit) return flat
   let end = Math.max(0, limit - 1)
   // slice(0, end) excludes text[end]: when that first excluded code unit is
   // a low surrogate, the last included one is its now-orphaned high half.
-  const cut = text.charCodeAt(end)
+  const cut = flat.charCodeAt(end)
   if (cut >= 0xDC00 && cut <= 0xDFFF && end > 0) end -= 1
-  return `${text.slice(0, end)}…`
+  return `${flat.slice(0, end)}…`
 }
 
 /**
@@ -1063,7 +1077,7 @@ export function renderMcpOverview(
     if (isServerDisabled(group.server, options.gate)) continue
     group.schemas.forEach((schema, index) => {
       const connector = index === group.schemas.length - 1 ? '└─' : '├─'
-      const description = truncateDescription(schema.description, options.descriptionLimit)
+      const description = truncateDescription(schema.description, Math.min(options.descriptionLimit, TREE_DESCRIPTION_LIMIT))
       lines.push(`${connector} ${schema.name}${description === '' ? '' : ` — ${description}`}`)
     })
   }
@@ -1136,7 +1150,7 @@ export function renderMcpDetail(
     }
     target.schemas.forEach((schema, index) => {
       const connector = index === target.schemas.length - 1 ? '└─' : '├─'
-      const description = truncateDescription(schema.description, options.descriptionLimit)
+      const description = truncateDescription(schema.description, Math.min(options.descriptionLimit, TREE_DESCRIPTION_LIMIT))
       lines.push(`${connector} ${schema.name}${description === '' ? '' : ` — ${description}`}`)
     })
     return { outcome: 'server', text: capRenderedLines(lines.join('\n')) }

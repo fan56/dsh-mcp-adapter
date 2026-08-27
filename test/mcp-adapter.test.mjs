@@ -10,6 +10,7 @@ import {
   serverOfToolName,
   isAllowedServer,
   truncateDescription,
+  renderMcpOverview,
   buildMcpListResult,
   dispatchMcpCall,
   createMcpListTool,
@@ -148,6 +149,24 @@ test('catalog: descriptions truncate to the limit with an ellipsis marker', () =
   assert.equal(truncateDescription('short', 200), 'short')
   const result = buildMcpListResult({}, [schema('mcp__s__t', long)], { prefix: 'mcp__', descriptionLimit: 20 })
   assert.equal(result.servers[0].tools[0].description.length, 20)
+})
+
+test('catalog: multi-paragraph descriptions collapse to a single line (tree stays readable)', () => {
+  const guide = 'Convert UI screenshots.\n\nUse this tool ONLY when the user wants to:\n- Generate frontend code\n\t- Produce design prompts'
+  // Whitespace runs collapse BEFORE any truncation decision.
+  const flat = truncateDescription(guide, 200)
+  assert.ok(!/[\n\r\t]/.test(flat), 'no control whitespace survives')
+  assert.ok(flat.startsWith('Convert UI screenshots. Use this tool ONLY when'), 'leading paragraph intact')
+  // Short enough after collapsing: kept whole (no stray ellipsis).
+  assert.equal(truncateDescription('a\n\nb', 200), 'a b')
+  // The /mcp overview tree stays one line per tool for such descriptions.
+  const overview = renderMcpOverview(
+    [schema('mcp__s__t', guide)],
+    { prefix: 'mcp__', keep: [], servers: [], descriptionLimit: 200 },
+    true,
+  )
+  const toolLine = overview.split('\n').find(line => line.includes('mcp__s__t'))
+  assert.equal(toolLine.split('\n').length, 1)
 })
 
 test('catalog: truncation never splits a surrogate pair', () => {
