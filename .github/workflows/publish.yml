@@ -1,0 +1,40 @@
+name: Publish
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+
+      - name: Install global dsh closure
+        run: npm install -g @deepseek-ai/dsh
+
+      - name: Link dsh closure types
+        run: node scripts/link-dsh-closure.mjs
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      # Gate the release on the same checks CI runs per push.
+      - name: Typecheck
+        run: npm run check
+
+      - name: Test
+        run: npm test
+
+      - name: Publish
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

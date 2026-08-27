@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The shipped engines floor plus current LTS.
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      # Typechecking imports @deepseek-ai/* from the global dsh closure via
+      # scripts/link-dsh-closure.mjs. A pristine runner has none, so install
+      # the public CLI first — it carries the closure the linker resolves.
+      - name: Install global dsh closure
+        run: npm install -g @deepseek-ai/dsh
+
+      - name: Link dsh closure types
+        run: node scripts/link-dsh-closure.mjs
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run check
+
+      - name: Test
+        run: npm test
