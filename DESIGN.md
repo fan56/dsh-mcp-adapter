@@ -232,3 +232,42 @@ export interface AdapterConfig {
 | 官方 MCP 工具定义（publicName 规范、execute 闭包、output.render） | packages/mcp/mcp-client/src/tools.ts:111-193, 244-361 |
 | 插件入口 + config schema 风格 | packages/mcp/mcp-client/src/index.ts:1-160 |
 | 模板仓库（scripts/tsconfig/test 风格） | [fan56/dsh-ask-router](https://github.com/fan56/dsh-ask-router) |
+
+---
+
+# 9. /mcp 命令（v0.2.0 设计追加）
+
+## 结论
+
+注册进平台命令服务 `@deepseek-ai/dsh-commands`（base bundle 自带，
+`ctx.commands.register`，官方消费者先例 command-feedback）。TUI 补全/
+回显与 web 斜杠面板自动出现（dsh-tui-pi src/commands.ts 读的就是这张表）；
+headless 经 apiproxy 同表可编程调用。**不新增任何配置项**，只读呈现。
+
+已知取舍：
+- 官方 dsh-mcp-client 不导出连接状态 → status 以「server 的工具在本
+  scope 注册表可见」二态表示（不可见 ≠ 未启用，可能正在重连退避）；
+- 不显示 transport 类型（避免双写配置漂移）；
+- 做成即时返回 text 的普通命令，**不进** tui-pi 的 MODAL_COMMANDS
+  （那是长驻弹窗专用白名单，且属另一仓库）。
+
+## 命令面
+
+| 形态 | 输出 |
+|---|---|
+| `/mcp` 或 `/mcp list` | 树形总览：per-server 分组挂工具名+截断描述；尾部 health 行（meta-tools live、folding active、folded N / kept M、约省 X 字符 schema——以 schema JSON 字符数为口径，明示非 token 数） |
+| `/mcp list <name>` | name 匹配某 server → 该 server 全部工具；匹配工具名 → 完整描述+inputSchema |
+| `/mcp config` | 当前 prefix/keep/servers/descriptionLimit 及各自命中工具清单（只读） |
+
+未知子命令或参数解析失败 → `{ kind:'error', text: usage }`。
+其余子命令一律拒绝并列出以上三种合法形态（遵守「只展示、零写操作」）。
+
+## 实现规则
+
+- handler 内 `invocation.agent` 作为 scope 传 `ctx.tools.schemas(scope)` /
+  `get(name, scope)`（agent 缺失时退化为全局视图）；所有树构建/过滤/
+  统计逻辑导出为纯函数（延续「cordis 只在 apply」约定）供 node --test 直测。
+- meta-tools live 判定与 waterfall 同源：`ctx.tools.get(name, scope) ===`
+  本插件定义对象；folding active 即该值 AND 至少折叠 >0 个。
+- 渲染上限防御：单次输出行数封顶（如 400 行），超出截断提示用
+  `list <server>` 收窄——防止巨型部署刷屏 transcript。
