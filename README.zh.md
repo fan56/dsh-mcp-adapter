@@ -75,7 +75,7 @@ config:
 
 ## 命令
 
-本插件在平台 `commands` 服务上注册一条斜杠命令。`/mcp` 展示状态；v0.2.0 起它同时也是整个 MCP server 进/出适配器的唯一控制面：
+本插件在平台 `commands` 服务上注册一条斜杠命令——该依赖是软性的：宿主若没有命令服务，折叠与两个 meta-tool 照常工作（只记一条日志警告，代价是没有 `/mcp`）。`/mcp` 展示状态；v0.2.0 起它同时也是整个 MCP server 进/出适配器的唯一控制面：
 
 | 形态 | 输出 |
 |---|---|
@@ -85,9 +85,11 @@ config:
 | `/mcp disable <id>` | 把一个 server 整体闩上：工具强制折叠出 prompt（keep 与 `servers` 豁免一并覆盖）、从 `mcp_list` 目录消失、`mcp_call` 拒绝并给 `/mcp enable <id>` 指引 |
 | `/mcp enable <id>` | 用同一个 stable id 复原 |
 
-其余形态一律回复用法说明。`/mcp` 观测到的每个 server 都会分到一个稳定数字 id（1..99，最小空闲优先），经 dsh settings 服务持久化到配置文件的 `mcp-adapter:` 小节（默认安装即 `~/.dsh/settings.yaml`）。id 跨重启、跨 re-sync 空窗保持不变，且永不回收——一个 id 永远指同一个 server；99 个用尽时 toggle 形态会明确报错。
+其余形态一律回复用法说明。`/mcp` 观测到的每个 server 都会分到一个稳定数字 id（1..99，最小空闲优先），经 dsh settings 服务持久化到配置文件的 `mcp-adapter:` 小节（默认安装即 `~/.dsh/settings.yaml`）。id 跨重启、跨 re-sync 空窗保持不变，且永不回收——一个 id 永远指同一个 server；99 个用尽时由 `/mcp` 视图明确标注（`id space exhausted (99/99): N server(s) beyond the cap cannot be gated`，受影响的分组行会带标记）。
 
 disable 是**门闩式开关，不是真断连**：官方 client 不提供断连 API，工具仍留在注册表里、连接照常运行——门闩只把它请出 prompt、目录与分发。三层门闩共用同一个判定函数，彼此之间以及与 `/mcp` 的展示永远不会口径不一。enable/disable 经 settings 服务持久化；没有 settings 服务时其余功能照常，只有 toggle 会回一条说明性报错。
+
+一条真实边界：门闩生效在 prompt 侧（目录/分发层）；记得完整工具名的模型仍可能原生直调 `mcp__server__tool` 成功——需要硬性拦截时，请配合管线 guard 或 `tools.restrict()`。
 
 状态是**二态语义**：server 出现在列表里 = 它的工具在本 scope 可见——不可见不代表未启用（可能正在重连退避）；官方 client 不暴露连接状态。健康行形如 `meta-tools: mcp_list/mcp_call live · folding ACTIVE — folded N, kept M · ~X chars of schema out of prompt`（meta-tools 存活且至少折叠一个工具时），否则降级为 fail-open（或无可折叠）提示。X 是被折叠 schema 的 JSON 字符数，刻意标注为字符而非 token。输出超过 400 行会被截断，并提示用 `/mcp list <server>` 收窄。
 

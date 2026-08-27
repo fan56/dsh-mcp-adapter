@@ -178,6 +178,15 @@ test('allocation never hands out an orphan-disabled id (hand-edited documents)',
   assert.equal(registry.serverIds.fs, 2, 'the burned id stays burned')
 })
 
+test('fail-open precedence beats the gate: not-live meta-tools keep disabled tools native', () => {
+  const gate = { serverIds: { fs: 1 }, disabled: [1] }
+  const input = { sections: [], contexts: [], variables: {}, tools: [schema('read'), schema('mcp__fs__read_file')] }
+  const result = foldPromptAssembly(input, OPTIONS, false, gate)
+  assert.strictEqual(result, input, 'assembly returned untouched, same reference')
+  assert.deepEqual(result.tools.map(tool => tool.name), ['read', 'mcp__fs__read_file'],
+    'without live meta-tools nothing may leave the prompt — gating included')
+})
+
 test('health parity: disabled tools count as folded in the overview footer', () => {
   const gate = { serverIds: { fs: 1, gh: 2 }, disabled: [1] }
   const text = renderMcpOverview(schemasFor(), { ...OPTIONS, gate }, true)
@@ -200,6 +209,21 @@ test('catalog: disabled servers vanish from the directory; expansion says why wi
   const filtered = buildMcpListResult({ server: 'fs' }, schemasFor(), options, gate)
   assert.match(filtered.error, /server "fs" is disabled and hidden/)
   assert.match(filtered.error, /\/mcp enable 1/)
+})
+
+test('catalog: verbose listings hide disabled servers just like compact ones', () => {
+  const gate = { serverIds: { fs: 1, gh: 2 }, disabled: [1] }
+  const result = buildMcpListResult({ verbose: true }, schemasFor(), OPTIONS, gate)
+  assert.deepEqual(result.servers.map(group => group.server), ['gh'])
+  assert.ok(!JSON.stringify(result).includes('mcp__fs'), 'no disabled tool or schema leaks through verbose')
+})
+
+test('catalog: when the gate hides EVERY prefix tool, the empty copy says so', () => {
+  const gate = { serverIds: { fs: 1, gh: 2 }, disabled: [1, 2] }
+  const result = buildMcpListResult({}, schemasFor(), OPTIONS, gate)
+  assert.match(result.error, /every MCP tool under the "mcp__" prefix belongs to a disabled server/)
+  assert.match(result.error, /hidden from the catalog/)
+  assert.match(result.error, /"fs" \("\/mcp enable 1"\), "gh" \("\/mcp enable 2"\)/)
 })
 
 // ---- latch 3: dispatch refusal after prefix validation, with guidance ----
@@ -242,7 +266,11 @@ test('factories: mcp_list/mcp_call observe the LIVE callback value on every exec
 
   gate = { serverIds: { gh: 2 }, disabled: [2] }
   const closedCatalog = await list.execute({}, {})
-  assert.deepEqual(closedCatalog, { error: 'no MCP tools are registered under the "mcp__" prefix' })
+  // Empty because of the gate reads as disabled-with-hint, never as
+  // "nothing is registered" (N3).
+  assert.match(closedCatalog.error, /disabled server/)
+  assert.match(closedCatalog.error, /hidden from the catalog/)
+  assert.match(closedCatalog.error, /\/mcp enable 2/)
   const refused = await call.execute({ tool: 'mcp__gh__x' }, {})
   assert.match(refused.error, /\/mcp enable 2/)
 })
@@ -287,6 +315,23 @@ test('config view: appends the persistent enable/disable inventory', () => {
   // Empty observations explain themselves.
   const fresh = renderMcpConfig(schemasFor(), { ...OPTIONS, gate: EMPTY() })
   assert.match(fresh, /\(no servers observed yet/)
+})
+
+test('config view: disabled-server tools stay listed in keep/servers hits but carry the pause marker', () => {
+  const gate = { serverIds: { fs: 1 }, disabled: [1] }
+  const options = { ...OPTIONS, keep: ['mcp__fs__*'], servers: ['fs', 'gh'], gate }
+  const text = renderMcpConfig(schemasFor(), options)
+  assert.match(text, /matches: mcp__fs__read_file ⏸, mcp__fs__write_file ⏸/,
+    'keep-pattern hits annotate gate-held tools')
+  assert.match(text, /- fs\n      tools: mcp__fs__read_file ⏸, mcp__fs__write_file ⏸/,
+    'servers-whitelist hits annotate gate-held tools')
+  assert.match(text, /- gh\n      tools: mcp__gh__create_issue\n/,
+    'enabled servers stay unmarked (views inform, never hide)')
+  // No gate snapshot → no markers anywhere (legacy shape untouched).
+  assert.doesNotMatch(
+    renderMcpConfig(schemasFor(), { ...OPTIONS, keep: ['mcp__fs__*'] }),
+    /⏸/,
+  )
 })
 
 test('detail view: disabled targets carry the restore hint but stay inspectable', () => {
@@ -406,18 +451,32 @@ test('command flow: unknown or not-live ids answer error + usage; exhaustion nam
   assert.equal(staleTarget.kind, 'error')
   assert.match(staleTarget.text, /has no visible tools in this scope right now/)
 
-  // A brand-new server in a FULL id space surfaces the exhaustion clearly.
+  // Servers beyond the FULL id space surface the exhaustion through the
+  // views (the promised behavior — toggles could never target an idless
+  // server), with each affected group marked and one explicit notice line.
   const serverIds = {}
   for (let id = 1; id <= MCP_SERVER_ID_LIMIT; id += 1) serverIds[`s${id}`] = id
-  const exhausted = await executeMcpCommand({
-    rawInput: '',
-    schemas: [...schemasFor(), schema(`mcp__overflow__t`)],
-    config: { ...OPTIONS, gate: { serverIds, disabled: [] } },
+  const fullGate = { serverIds, disabled: [] }
+  const overflowSchemas = [...schemasFor(), schema('mcp__overflow__t')]
+  const viewArgs = {
+    schemas: overflowSchemas,
+    config: { ...OPTIONS, gate: fullGate },
     metaToolsLive: true,
-    gate: { serverIds, disabled: [] },
+    gate: fullGate,
     writeGate: noop,
-  })
+  }
+  const exhausted = await executeMcpCommand({ rawInput: '', ...viewArgs })
   assert.equal(exhausted.kind, 'success', 'status queries still render around the failure')
+  assert.match(
+    exhausted.text,
+    /id space exhausted \(99\/99\): 3 server\(s\) beyond the cap cannot be gated/,
+    'overview names the exhausted cap and the unassignable count',
+  )
+  assert.match(exhausted.text, /^\[-\] fs \(2\) — beyond the id cap$/m, 'overflow group headers carry the marker')
+
+  const exhaustedConfig = await executeMcpCommand({ rawInput: 'config', ...viewArgs })
+  assert.equal(exhaustedConfig.kind, 'success')
+  assert.match(exhaustedConfig.text, /id space exhausted \(99\/99\): 3 server\(s\) beyond the cap cannot be gated/)
 })
 
 test('command flow: absent settings service and failed persistence surface as errors', async () => {
@@ -447,19 +506,62 @@ test('command flow: absent settings service and failed persistence surface as er
   assert.match(failing.text, /state unchanged/)
 })
 
+test('command flow: an aborted toggle stops waiting and reports the unconfirmed state', async () => {
+  // A write whose settlement we control: the race must return the moment
+  // the signal fires, while the background write still lands.
+  let release
+  const settle = new Promise(resolve => { release = resolve })
+  let landed = false
+  const slowWrite = async () => { await settle; landed = true }
+  const gateState = { serverIds: { fs: 1 }, disabled: [] }
+  const viewArgs = {
+    schemas: schemasFor(),
+    config: { ...OPTIONS, gate: gateState },
+    metaToolsLive: true,
+    gate: gateState,
+    writeGate: slowWrite,
+  }
+  const controller = new AbortController()
+  const started = executeMcpCommand({ rawInput: 'disable 1', ...viewArgs, signal: controller.signal })
+  controller.abort()
+  const outcome = await started
+  assert.equal(outcome.kind, 'error')
+  assert.match(outcome.text, /"\/mcp disable 1" — persist interrupted before confirming/)
+  assert.match(outcome.text, /rerun `\/mcp config` to check the actual state/)
+
+  release()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(landed, true, 'the abandoned write still completes in the background')
+
+  // An already-aborted signal short-circuits without even starting the wait.
+  const preAborted = await executeMcpCommand({
+    rawInput: 'disable 1',
+    ...viewArgs,
+    writeGate: async () => {},
+    signal: AbortSignal.abort(),
+  })
+  assert.equal(preAborted.kind, 'error')
+  assert.match(preAborted.text, /persist interrupted before confirming/)
+})
+
 // ---- apply() wiring with a mocked settings registration ----
 
 /**
  * Settings seam stub: register(ns, schema) layers defaults like production;
  * replace records each section so tests can watch the exact write payload.
+ * A "broken read" simulates a provider whose resolved-value lookup throws —
+ * the B1 fail-open contract is that consumers see an absent gate instead.
  */
-function settingsHost(store) {
+function settingsHost(store, brokenRead = false) {
   return {
     register(ns, schemaFn) {
       const entry = store.sections[ns] ?? (store.sections[ns] = { resolved: schemaFn({}), user: undefined })
       if (entry.resolved === undefined) entry.resolved = schemaFn({})
       return {
-        get: () => entry.resolved,
+        get: () => {
+          if (brokenRead) throw new Error('settings backend exploded')
+          return entry.resolved
+        },
         replace: async (section) => {
           entry.user = section
           entry.resolved = schemaFn(section)
@@ -470,7 +572,7 @@ function settingsHost(store) {
   }
 }
 
-function stubCtx({ mountSettings = true } = {}) {
+function stubCtx({ mountSettings = true, brokenGateReads = false, mountCommands = true } = {}) {
   const store = { sections: {}, writes: [] }
   const state = {
     registered: new Map(), commands: new Map(), effects: [], warnings: [],
@@ -496,7 +598,13 @@ function stubCtx({ mountSettings = true } = {}) {
     inject(services, callback) {
       state.injections.push([...services])
       let disposer
-      if (mountSettings && services.includes('settings')) disposer = callback({ settings: settingsHost(store) })
+      if (mountSettings && services.includes('settings')) disposer = callback({ settings: settingsHost(store, brokenGateReads) })
+      if (mountCommands && services.includes('commands')) {
+        // The soft mount's callback returns the teardown disposer; surface it
+        // as a labeled effect so tests can exercise teardown exactly.
+        const commandDisposer = callback({ commands: ctx.commands, logger: ctx.logger })
+        if (commandDisposer !== undefined) state.effects.push({ disposer: commandDisposer, label: 'mcp-adapter.command' })
+      }
       return () => { if (disposer !== undefined) disposer() }
     },
     on(event, listener) { state.listeners.push({ event, listener }); return () => {} },
@@ -512,6 +620,8 @@ test('apply(): settings namespace registered under "mcp-adapter"; ids assigned a
   const { ctx, state } = stubCtx()
   apply(ctx, BASE_CONFIG)
   assert.deepEqual(state.injections[0], ['settings'])
+  assert.deepEqual(state.injections[1], ['commands'],
+    'the commands service rides a runtime soft-mount, not the static inject')
   const namespaceEntry = state.store.sections[MCP_ADAPTER_SETTINGS_NAMESPACE]
   assert.deepEqual(namespaceEntry.resolved, { serverIds: {}, disabled: [] })
 
@@ -616,4 +726,39 @@ test('apply(): without a settings service the command explains it and folding co
   const folded = await listener(assembly, { scope: undefined }, () => Promise.resolve(assembly))
   assert.deepEqual(folded.tools.map(tool => tool.name), ['read'],
     'no gate snapshot keeps the fold semantics identical to v0.1')
+})
+
+test('apply(): a throwing gate read degrades to enabled-everything and warns once (B1)', async () => {
+  const { ctx, state } = stubCtx({ brokenGateReads: true })
+  apply(ctx, BASE_CONFIG)
+  state.registered.set('mcp__fs__read_file', liveTool('mcp__fs__read_file'))
+  const handler = state.commands.get('mcp').handler
+
+  // The command survives the throwing read; ids simply never render.
+  const tree = await handler(invocationLike(''))
+  assert.equal(tree.kind, 'success', 'the handler must not surface the settings error')
+  assert.match(tree.text, /^fs \(1\)$/m, 'absent gate degrades the header to the legacy shape')
+
+  // The waterfall survives too: no exception escapes assemble; folding runs
+  // ungated (identical semantics to "nothing disabled").
+  const assembly = { sections: [], contexts: [], variables: {}, tools: [schema('read'), schema('mcp__fs__read_file')] }
+  const listener = state.listeners.find(entry => entry.event === 'system-prompt/assemble').listener
+  const folded = await listener(assembly, { scope: undefined }, () => Promise.resolve(assembly))
+  assert.deepEqual(folded.tools.map(tool => tool.name), ['read'])
+
+  // Both meta-tools read through the same defended callback — open latches.
+  const catalog = await state.registered.get(MCP_LIST_TOOL_NAME).execute({}, { agent: undefined })
+  assert.deepEqual(catalog.servers.map(group => group.server), ['fs'])
+  const dispatched = await state.registered.get(MCP_CALL_TOOL_NAME).execute(
+    { tool: 'mcp__fs__read_file' }, { agent: undefined },
+  )
+  assert.deepEqual(dispatched, { ok: true, args: {} }, 'dispatch went through with the gate absent')
+
+  // Exactly ONE warning across every read path, and repeat invocations stay quiet.
+  assert.equal(state.warnings.length, 1)
+  assert.match(state.warnings[0], /reading the persisted enable\/disable state failed/)
+  assert.match(state.warnings[0], /treating every server as enabled/)
+  await handler(invocationLike('config'))
+  await listener(assembly, { scope: undefined }, () => Promise.resolve(assembly))
+  assert.equal(state.warnings.length, 1, 'warn-once dedupe holds across consumers')
 })

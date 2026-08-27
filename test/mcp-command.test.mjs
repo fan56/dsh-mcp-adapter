@@ -17,6 +17,7 @@ import {
   renderMcpConfig,
   executeMcpCommand,
   apply,
+  inject as declaredInject,
 } from '../lib/index.js'
 
 const OPTIONS = { prefix: 'mcp__', keep: [], servers: [], descriptionLimit: 200 }
@@ -353,9 +354,10 @@ function settingsStub(store) {
  * Standalone ctx stub mirroring mcp-adapter.test.mjs's fakeCtx plus the
  * `commands` service and an optional mounted `settings` service, with scope
  * recording and a live-mask hook so the fail-open branch of the command
- * handler can be exercised.
+ * handler can be exercised. `mountCommands: false` simulates a host that
+ * never composes the platform commands service.
  */
-function stubCtx({ mountSettings = true } = {}) {
+function stubCtx({ mountSettings = true, mountCommands = true } = {}) {
   const store = { sections: {}, writes: [] }
   const state = { registered: new Map(), commands: new Map(), effects: [], warnings: [], schemaScopes: [], maskedMeta: false, injections: [], store }
   const ctx = {
@@ -388,6 +390,10 @@ function stubCtx({ mountSettings = true } = {}) {
       let disposer
       if (mountSettings && services.includes('settings')) {
         disposer = callback({ settings: settingsStub(store) })
+      }
+      if (mountCommands && services.includes('commands')) {
+        const commandDisposer = callback({ commands: ctx.commands, logger: ctx.logger })
+        if (commandDisposer !== undefined) state.effects.push({ disposer: commandDisposer, label: 'mcp-adapter.command' })
       }
       return () => { if (disposer !== undefined) disposer() }
     },
@@ -456,4 +462,29 @@ test('apply(): command teardown disposes exactly the command registration', () =
   assert.equal(state.commands.has(MCP_COMMAND_NAME), true)
   commandEffect.disposer()
   assert.equal(state.commands.has(MCP_COMMAND_NAME), false)
+})
+
+test('apply(): the commands service stays a SOFT dependency (static inject is tools-only)', async () => {
+  assert.deepEqual(declaredInject, ['tools'],
+    'listing commands statically would refuse to load on hosts without it')
+  // On such a host the plugin still loads: one warning, no command, and the
+  // meta-tools + assembly listener untouched.
+  const { ctx, state } = stubCtx({ mountCommands: false })
+  apply(ctx, { ...OPTIONS })
+  state.registered.set('mcp__fs__read_file', schema('mcp__fs__read_file', 'Read files'))
+  assert.equal(state.commands.has(MCP_COMMAND_NAME), false)
+
+  // The absence notice arrives once the deferred mount check gives up.
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(state.warnings.length, 1)
+  assert.match(state.warnings[0], /no platform commands service/)
+  assert.match(state.warnings[0], /folding and meta-tools keep working/)
+
+  // Everything but /mcp keeps working.
+  const catalog = await state.registered.get(MCP_LIST_TOOL_NAME).execute({}, { agent: undefined })
+  assert.deepEqual(catalog.servers.map(group => group.server), ['fs'])
+  const listener = state.listeners.find(entry => entry.event === 'system-prompt/assemble').listener
+  const input = { sections: [], contexts: [], variables: {}, tools: [schema('read'), schema('mcp__fs__read_file')] }
+  const folded = await listener(input, { scope: undefined }, () => Promise.resolve(input))
+  assert.deepEqual(folded.tools.map(tool => tool.name), ['read'])
 })

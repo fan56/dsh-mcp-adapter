@@ -73,8 +73,13 @@ import type {} from '@deepseek-ai/dsh-settings'
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'mcp-adapter'
 
-/** Services required by this plugin. */
-export const inject = ['tools', 'commands']
+/**
+ * Services required by this plugin — deliberately just `tools`. The platform
+ * `commands` service is consumed SOFTLY at runtime ({@link apply} mounts it
+ * via `ctx.inject`): listing it here would refuse to load the whole plugin on
+ * hosts that do not compose commands, taking folding down with the command.
+ */
+export const inject = ['tools']
 
 /** Registered slash-command name (read-only status surface). */
 export const MCP_COMMAND_NAME = 'mcp'
@@ -578,6 +583,8 @@ export function buildMcpListResult(
     return { tool: { name: schema.name, description: schema.description, parameters: schema.parameters } }
   }
   const serversOut: CatalogServerEntry[] = []
+  // Servers that passed prefix/whitelist checks but were hidden by the gate.
+  const gatedAway: string[] = []
   for (const schema of schemas) {
     // Never catalog the meta-tools themselves, even under a prefix that
     // matches their names.
@@ -587,7 +594,10 @@ export function buildMcpListResult(
     const server = serverOfToolName(schema.name, prefix)
     // Disabled servers vanish from the directory entirely; point-name
     // expansion above remains the structured way to learn why.
-    if (isServerDisabled(server, gate)) continue
+    if (isServerDisabled(server, gate)) {
+      if (!gatedAway.includes(server)) gatedAway.push(server)
+      continue
+    }
     if (args.server !== undefined && server !== args.server) continue
     let group = serversOut.find(entry => entry.server === server)
     if (group === undefined) {
@@ -604,6 +614,14 @@ export function buildMcpListResult(
     if (args.server !== undefined && isServerDisabled(args.server, gate)) {
       const id = gate?.serverIds[args.server]
       return { error: `server "${args.server}" is disabled and hidden from the catalog — restore it with "/mcp enable ${String(id)}"` }
+    }
+    // An unfiltered catalog that found prefix tools but lost ALL of them to
+    // the gate must not claim "nothing is registered" (same facts as the
+    // filtered path above): name each hidden server with its restore hint.
+    if (args.server === undefined && gatedAway.length > 0) {
+      const named = gatedAway.map(name =>
+        `"${name}" ("/mcp enable ${String(gate?.serverIds[name])}")`).join(', ')
+      return { error: `every MCP tool under the "${prefix}" prefix belongs to a disabled server and is hidden from the catalog: ${named}` }
     }
     return args.server === undefined
       ? { error: `no MCP tools are registered under the "${prefix}" prefix` }
@@ -749,6 +767,14 @@ export interface McpCommandOptions {
    * renderers pure and never stale within one command execution.
    */
   gate?: ServerGateState
+  /**
+   * Live server names left WITHOUT a stable id because the 1..99 space was
+   * full when they appeared (production:
+   * {@link ServerIdAllocation.unassigned}). Views — not an erroring toggle —
+   * surface that fact, since a server without an id cannot be targeted by
+   * one in the first place.
+   */
+  unassignedServers?: readonly string[]
 }
 
 /** Usage text returned for unparseable /mcp invocations. */
@@ -995,12 +1021,29 @@ export function capRenderedLines(text: string, limit: number = MCP_OUTPUT_LINE_L
 }
 
 /**
+ * The one-line id-exhaustion notice for /mcp views. `undefined` while the
+ * stable id space has room. This is where the 99-cap promise lands: a server
+ * beyond the cap never gets an id, so no toggle could ever target it — the
+ * views say so explicitly instead of pretending otherwise.
+ * @param unassigned - live servers observed without an assignable id.
+ * @returns the notice line, or nothing when the space is not exhausted.
+ */
+export function renderIdCapNotice(unassigned?: readonly string[]): string | undefined {
+  if (unassigned === undefined || unassigned.length === 0) return undefined
+  return `id space exhausted (${MCP_SERVER_ID_LIMIT}/${MCP_SERVER_ID_LIMIT}): `
+    + `${unassigned.length} server(s) beyond the cap cannot be gated`
+}
+
+/**
  * Render the `/mcp` / `/mcp list` tree overview: one block per server with
  * each tool's name and truncated description (disabled servers show only a
  * `⏸ disabled` header line — their tools are hidden), closed by the
- * folding-health footer line. Output is line-capped defensively.
+ * folding-health footer line. Servers beyond the id cap carry a marker on
+ * their group header, and full exhaustion appends an explicit notice after
+ * the footer. Output is line-capped defensively.
  * @param schemas - schemas visible to the receiving agent.
- * @param options - adapter knobs (prefix/keep/servers/descriptionLimit/gate).
+ * @param options - adapter knobs (prefix/keep/servers/descriptionLimit/gate/
+ *   unassignedServers).
  * @param metaToolsLive - whether both meta-tools are live in that scope.
  * @returns the complete overview text.
  */
@@ -1013,7 +1056,10 @@ export function renderMcpOverview(
   const total = groups.reduce((sum, group) => sum + group.schemas.length, 0)
   const lines = [`MCP servers/tools — ${total} tool(s) across ${groups.length} server(s)`]
   for (const group of groups) {
-    lines.push('', renderServerGroupHeader(group, options.gate))
+    const header = renderServerGroupHeader(group, options.gate)
+    lines.push('', options.unassignedServers?.includes(group.server)
+      ? `${header} — beyond the id cap`
+      : header)
     if (isServerDisabled(group.server, options.gate)) continue
     group.schemas.forEach((schema, index) => {
       const connector = index === group.schemas.length - 1 ? '└─' : '├─'
@@ -1022,6 +1068,8 @@ export function renderMcpOverview(
     })
   }
   lines.push('', renderMcpHealthLine(collectMcpHealth(schemas, options, metaToolsLive).health))
+  const idCapNotice = renderIdCapNotice(options.unassignedServers)
+  if (idCapNotice !== undefined) lines.push(idCapNotice)
   return capRenderedLines(lines.join('\n'))
 }
 
@@ -1109,13 +1157,22 @@ export function renderMcpDetail(
  * Render the effective configuration with each knob's hitting tools:
  * which names match the prefix, what each keep pattern holds back, and what
  * each whitelisted server contributes. Read-only inventory, no mutations.
+ * Tools of disabled servers stay LISTED but carry a `⏸` marker — views
+ * inform, they never hide.
  * @param schemas - schemas visible to the receiving agent.
- * @param options - adapter knobs (prefix/keep/servers/descriptionLimit).
+ * @param options - adapter knobs (prefix/keep/servers/descriptionLimit/gate/
+ *   unassignedServers).
  * @returns the rendered configuration view.
  */
 export function renderMcpConfig(schemas: readonly ToolSchema[], options: McpCommandOptions): string {
   const candidates = mcpCommandCandidates(schemas, options)
   const servers = options.servers ?? []
+  // Inventory completeness over gating: mark gate-held tools instead of
+  // dropping them (the human inspection surface is never gated).
+  const annotateDisabled = (name: string): string =>
+    options.gate !== undefined && isServerDisabled(serverOfToolName(name, options.prefix), options.gate)
+      ? `${name} ⏸`
+      : name
   const lines = [
     `mcp-adapter configuration (read-only)`,
     '',
@@ -1129,7 +1186,10 @@ export function renderMcpConfig(schemas: readonly ToolSchema[], options: McpComm
   }
   for (const pattern of options.keep) {
     const hits = candidates.filter(schema => matchesKeep(schema.name, [pattern]))
-    lines.push(`  - ${pattern}`, hits.length === 0 ? '      (no matching tools)' : `      matches: ${hits.map(schema => schema.name).join(', ')}`)
+    lines.push(
+      `  - ${pattern}`,
+      hits.length === 0 ? '      (no matching tools)' : `      matches: ${hits.map(schema => annotateDisabled(schema.name)).join(', ')}`,
+    )
   }
   lines.push('', `servers whitelist (fold/catalog/dispatch boundary): ${servers.length}`)
   if (servers.length === 0) {
@@ -1137,7 +1197,10 @@ export function renderMcpConfig(schemas: readonly ToolSchema[], options: McpComm
   }
   for (const server of servers) {
     const hits = candidates.filter(schema => serverOfToolName(schema.name, options.prefix) === server)
-    lines.push(`  - ${server}`, hits.length === 0 ? '      (no matching tools)' : `      tools: ${hits.map(schema => schema.name).join(', ')}`)
+    lines.push(
+      `  - ${server}`,
+      hits.length === 0 ? '      (no matching tools)' : `      tools: ${hits.map(schema => annotateDisabled(schema.name)).join(', ')}`,
+    )
   }
   // Persistent gate inventory — only meaningful with a live settings-backed
   // snapshot, so absent snapshots keep the legacy output untouched.
@@ -1152,6 +1215,8 @@ export function renderMcpConfig(schemas: readonly ToolSchema[], options: McpComm
         ? `  - [${id}] ${server} ⏸ disabled`
         : `  - [${id}] ${server}`)
     }
+    const idCapNotice = renderIdCapNotice(options.unassignedServers)
+    if (idCapNotice !== undefined) lines.push('', idCapNotice)
   }
   return capRenderedLines(lines.join('\n'))
 }
@@ -1181,6 +1246,13 @@ export interface McpCommandView {
    * explanatory error instead of silently dropping the intent.
    */
   writeGate?: (next: ServerIdRegistry) => Promise<void>
+  /**
+   * Cancellation signal owned by the dispatching UI request (production:
+   * `invocation.signal`). Only the WAIT rides it: an aborted toggle answers
+   * immediately that the outcome is unconfirmed while the write still
+   * finishes in the background — same-process code cannot hard-kill it.
+   */
+  signal?: AbortSignal
 }
 
 /** CommandResult-compatible outcome (platform shape: success may omit text). */
@@ -1212,6 +1284,8 @@ export async function executeMcpCommand(view: McpCommandView): Promise<McpComman
   // Stable-id observation point: whatever this invocation can see gets its
   // persistent id now (only when gating is actually wired). Failures keep the
   // local assignment for this render and simply re-run deterministically.
+  // Servers that fit no free id travel with the view instead — the views
+  // label the exhausted cap, since a toggle cannot target an idless server.
   let effectiveView: McpCommandView = view
   let registry: ServerIdRegistry | undefined
   if (view.gate !== undefined && view.writeGate !== undefined) {
@@ -1219,12 +1293,18 @@ export async function executeMcpCommand(view: McpCommandView): Promise<McpComman
     registry = allocation.registry
     if (allocation.added.length > 0) {
       try {
-        await view.writeGate(registry)
+        // The allocation write races the invocation signal like a toggle
+        // write: an aborted caller stops waiting while the background write
+        // still lands (re-allocation is deterministic anyway).
+        await raceWriteAck(view.writeGate(registry), view.signal)
       } catch {
         // Persistence failures must not block a status query.
       }
     }
-    effectiveView = { ...view, config: { ...config, gate: registry } }
+    effectiveView = {
+      ...view,
+      config: { ...config, gate: registry, unassignedServers: allocation.unassigned },
+    }
   }
   switch (parsed.form) {
     case 'overview':
@@ -1238,6 +1318,43 @@ export async function executeMcpCommand(view: McpCommandView): Promise<McpComman
     case 'disable':
     case 'enable':
       return runServerToggle(parsed.form, parsed.id, registry, effectiveView)
+  }
+}
+
+/** Sentinel returned by {@link raceWriteAck} when the caller's WAIT was cut
+ * short by the invocation signal (the write itself keeps running). */
+const WRITE_ABANDONED: unique symbol = Symbol('mcp-adapter.write-abandoned')
+
+/**
+ * Await one persistence write, giving up the wait as soon as `signal` aborts.
+ * The losing write keeps running in the background — `Promise.race` only
+ * cancels the waiting, never the work — and the raced promise is subscribed
+ * either way, so a late background failure cannot surface as unhandled.
+ */
+async function raceWriteAck<T>(
+  write: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T | typeof WRITE_ABANDONED> {
+  if (signal === undefined) return write
+  // An already-aborted caller must not see a raced write win the settlement
+  // race merely by subscription order: report abandonment outright and keep
+  // the background write's failure non-fatal.
+  if (signal.aborted) {
+    write.catch(() => {})
+    return WRITE_ABANDONED
+  }
+  let onAbort: (() => void) | undefined
+  const abandoned = new Promise<typeof WRITE_ABANDONED>(resolve => {
+    if (signal.aborted) resolve(WRITE_ABANDONED)
+    else {
+      onAbort = () => resolve(WRITE_ABANDONED)
+      signal.addEventListener('abort', onAbort, { once: true })
+    }
+  })
+  try {
+    return await Promise.race([write, abandoned])
+  } finally {
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
   }
 }
 
@@ -1274,7 +1391,14 @@ async function runServerToggle(
     }
   }
   try {
-    await view.writeGate(toggle.registry)
+    const settled = await raceWriteAck(view.writeGate(toggle.registry), view.signal)
+    if (settled === WRITE_ABANDONED) {
+      // The signal cut only the WAIT; the write keeps running to completion.
+      return {
+        kind: 'error',
+        text: `"/mcp ${form} ${id}" — persist interrupted before confirming; rerun \`/mcp config\` to check the actual state`,
+      }
+    }
   } catch (error) {
     return {
       kind: 'error',
@@ -1538,8 +1662,14 @@ export function createMcpCallTool(
  * Server gating: when a dsh settings service is composed, the `mcp-adapter`
  * namespace is registered on it and every gate consumer reads FRESH resolved
  * values through small callbacks — the plugin keeps no in-memory copy that
- * could drift from settings. Without settings everything still works; only
- * `/mcp disable`/`enable` answer with an explanatory error.
+ * could drift from settings. The read itself is defended too: if the
+ * resolved-value lookup throws, consumers see an absent gate (everything
+ * enabled) instead of the error, keeping the assemble waterfall alive.
+ *
+ * Commands: `/mcp` mounts through a runtime `ctx.inject(['commands'], ...)`
+ * (same seam as settings), so hosts without the commands service keep this
+ * plugin fully functional — one warning, no command. A registration name
+ * conflict degrades to the same warning independently.
  *
  * @param ctx - plugin context carrying the tool registry.
  * @param config - resolved adapter configuration.
@@ -1567,11 +1697,32 @@ export function apply(ctx: Context, config: AdapterConfig): void {
       return () => { settingsScope = undefined }
     })
   }
+  // One-shot latch: a persistently broken settings provider would otherwise
+  // re-warn on EVERY assembled prompt (getGate runs per waterfall execution).
+  let gateReadWarned = false
   // Fresh snapshot per read; normalize guards hand-edited documents. The
   // scope being absent is distinguishable from an empty section: undefined
   // propagates so toggle commands can name their missing dependency.
-  const getGate = (): ServerGateState | undefined =>
-    settingsScope === undefined ? undefined : normalizeServerGate(settingsScope.get())
+  const getGate = (): ServerGateState | undefined => {
+    const scope = settingsScope
+    if (scope === undefined) return undefined
+    try {
+      return normalizeServerGate(scope.get())
+    } catch (error) {
+      // Fail-open, hard requirement: a throwing read must never blow up the
+      // system-prompt/assemble waterfall or a /mcp invocation. Gate-less
+      // means every server counts as enabled — visibility only ever grows.
+      if (!gateReadWarned) {
+        gateReadWarned = true
+        ctx.logger.warn(
+          `mcp-adapter: reading the persisted enable/disable state failed `
+          + `(${error instanceof Error ? error.message : String(error)}) `
+          + '— treating every server as enabled',
+        )
+      }
+      return undefined
+    }
+  }
   const writeGate = async (next: ServerIdRegistry): Promise<void> => {
     const scope = settingsScope
     if (scope === undefined) throw new Error('settings service went away before the write')
@@ -1622,41 +1773,73 @@ export function apply(ctx: Context, config: AdapterConfig): void {
   })
 
   // Status + server toggles on the platform command service (visible in TUI
-  // completion and web slash panels). Orthogonal to folding: a name conflict
-  // here must not disable the meta-tools, so it degrades independently.
-  try {
-    const commandDisposer = ctx.commands.register({
-      name: MCP_COMMAND_NAME,
-      description: 'Show MCP status; disable/enable MCP servers',
-      input: { hint: '[list [server|tool] | config | disable <id> | enable <id>]' },
-      handler: invocation => {
-        // The receiving agent's restricted view; an absent agent degrades to
-        // the global registry view (`schemas()` without scope).
-        const scope = invocation.agent ?? undefined
-        const schemas = ctx.tools.schemas(scope)
-        const metaToolsLive = ctx.tools.get(MCP_LIST_TOOL_NAME, scope) === listDefinition
-          && ctx.tools.get(MCP_CALL_TOOL_NAME, scope) === callDefinition
-        return executeMcpCommand({
-          rawInput: invocation.rawInput,
-          schemas,
-          config: {
-            prefix: config.prefix,
-            keep: config.keep,
-            servers: config.servers,
-            descriptionLimit: config.descriptionLimit,
-            gate: getGate(),
-          },
-          metaToolsLive,
-          gate: getGate(),
-          writeGate,
-        })
-      },
-    })
-    ctx.effect(() => commandDisposer, 'mcp-adapter.command')
-  } catch (error) {
+  // completion and web slash panels). The service is mounted SOFTLY: unlike
+  // a static `inject` entry, an absent commands service only costs the
+  // command — the meta-tools, waterfall, and gating load regardless.
+  if (typeof ctx.inject !== 'function') {
     ctx.logger.warn(
-      `mcp-adapter: "/${MCP_COMMAND_NAME}" command registration failed `
-      + `(${error instanceof Error ? error.message : String(error)}) — meta-tools keep working`,
+      `mcp-adapter: context cannot inject services — "/${MCP_COMMAND_NAME}" is unavailable; `
+      + 'folding and meta-tools keep working',
     )
+  } else {
+    let mounted = false
+    // Deferred so a callback that fires synchronously (services already
+    // present) does not trip over the not-yet-assigned handle.
+    let mountCheck: ReturnType<typeof setTimeout> | undefined
+    ctx.inject(['commands'], (ccmds) => {
+      mounted = true
+      if (mountCheck !== undefined) clearTimeout(mountCheck)
+      try {
+        const commandDisposer = ccmds.commands.register({
+          name: MCP_COMMAND_NAME,
+          description: 'Show MCP status; disable/enable MCP servers',
+          input: { hint: '[list [server|tool] | config | disable <id> | enable <id>]' },
+          handler: invocation => {
+            // The receiving agent's restricted view; an absent agent degrades to
+            // the global registry view (`schemas()` without scope).
+            const scope = invocation.agent ?? undefined
+            const schemas = ctx.tools.schemas(scope)
+            const metaToolsLive = ctx.tools.get(MCP_LIST_TOOL_NAME, scope) === listDefinition
+              && ctx.tools.get(MCP_CALL_TOOL_NAME, scope) === callDefinition
+            // ONE snapshot per execution keeps config.gate and view.gate identical.
+            const gate = getGate()
+            return executeMcpCommand({
+              rawInput: invocation.rawInput,
+              schemas,
+              config: {
+                prefix: config.prefix,
+                keep: config.keep,
+                servers: config.servers,
+                descriptionLimit: config.descriptionLimit,
+                gate,
+              },
+              metaToolsLive,
+              gate,
+              signal: invocation.signal,
+              writeGate,
+            })
+          },
+        })
+        // Disposing the injected fiber disposes exactly this registration;
+        // if the service restarts, cordis re-runs this callback and a fresh
+        // registration takes its place.
+        return () => commandDisposer()
+      } catch (error) {
+        ccmds.logger.warn(
+          `mcp-adapter: "/${MCP_COMMAND_NAME}" command registration failed `
+          + `(${error instanceof Error ? error.message : String(error)}) — meta-tools keep working`,
+        )
+      }
+    })
+    // One heads-up for hosts that genuinely never compose the commands
+    // service; cancelled by the mount above whenever it lands.
+    mountCheck = setTimeout(() => {
+      if (!mounted) {
+        ctx.logger.warn(
+          `mcp-adapter: no platform commands service — "/${MCP_COMMAND_NAME}" is unavailable; `
+          + 'folding and meta-tools keep working',
+        )
+      }
+    }, 0)
   }
 }

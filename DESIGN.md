@@ -271,6 +271,13 @@ headless 经 apiproxy 同表可编程调用。**不新增任何配置项**，只
   本插件定义对象；folding active 即该值 AND 至少折叠 >0 个。
 - 渲染上限防御：单次输出行数封顶（如 400 行），超出截断提示用
   `list <server>` 收窄——防止巨型部署刷屏 transcript。
+- **命令服务软挂载**（2026-08-27 复核定案）：静态 `inject` 只列
+  `['tools']`——把 `commands` 列进去会让无命令服务的宿主**整体拒载**
+  本插件，折叠随之消失，违反 fail-open 方向。apply 经运行时
+  `ctx.inject(['commands'], …)`（同 settings 的可选挂载姿势）拉起后注册；
+  服务缺席只警告一句、其余功能完好。gate 快照读取同理加固：
+  `settingsScope.get()` 抛错时按 gate 缺席处理（全 enabled）并去重告警一次，
+  绝不让异常炸出 system-prompt/assemble waterfall。
 
 ## v0.2.0 追记：/mcp enable/disable（门闩式 server 开关）
 
@@ -295,7 +302,10 @@ headless 经 apiproxy 同表可编程调用。**不新增任何配置项**，只
 - **ID 分配**：`/mcp` 任一形态执行时观测本 scope 的 live server 集合，
   为首次出现者分配最小空闲 id（1..99）。已分配永不回收——enable 不发新号，
   映射不做删除 → 重启与 re-sync 空窗下 id 稳定指同一 server。99 用尽：
-  只读视图照常渲染（未分配者显示 `[-]`），toggle 明确报错说明空间耗尽。
+  承诺落在**视图层**（未分配的 server 本就没有 id，toggle 无法也无需为它
+  报错）——只读视图照常渲染：未分配者分组行显示 `[-] … — beyond the id cap`，
+  overview/config 末尾追加一行明示耗尽（如
+  `id space exhausted (99/99): <n> server(s) beyond the cap cannot be gated`）。
   手工编辑残留的孤儿 disabled id 视作已烧掉（分配跳过），新 server 不会
   继承别人留下的闸。
 - **持久化**：dsh settings 服务 namespace `mcp-adapter`（kebab-case 经
