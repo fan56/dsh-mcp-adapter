@@ -538,7 +538,7 @@ const BASE_CONFIG = { prefix: 'mcp__', keep: [], servers: [], descriptionLimit: 
 function fakeCtx({ failOn } = {}) {
   const state = {
     registered: new Map(), listeners: [], effects: [], warnings: [],
-    commands: new Map(),
+    commands: new Map(), injections: [],
   }
   const ctx = {
     tools: {
@@ -560,6 +560,12 @@ function fakeCtx({ failOn } = {}) {
         state.commands.set(definition.name, definition)
         return () => state.commands.delete(definition.name)
       },
+    },
+    // No settings service composed here: apply's optional gating wiring
+    // degrades to "everything enabled" and records the request.
+    inject(services, callback) {
+      state.injections.push([...services])
+      return () => {}
     },
     on(event, listener) {
       state.listeners.push({ event, listener })

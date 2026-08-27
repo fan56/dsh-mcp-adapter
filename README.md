@@ -83,15 +83,21 @@ config:
 
 ## Commands
 
-The plugin registers a single **read-only** slash command on the platform `commands` service — `/mcp` shows status, mutates nothing:
+The plugin registers one slash command on the platform `commands` service. `/mcp` reports status, and since v0.2.0 it is also the control surface for taking a whole MCP server in or out of the adapter:
 
 | Form | Output |
 |---|---|
-| `/mcp` or `/mcp list` | Tree overview of MCP servers/tools (names + truncated descriptions), closed by a folding-health footer |
-| `/mcp list <name>` | `<name>` matching a server → that server's full tool list; matching a full tool name → full description + complete input schema |
-| `/mcp config` | The effective `prefix` / `keep` / `servers` / `descriptionLimit`, each with its hitting tools |
+| `/mcp` or `/mcp list` | Tree overview — every server line carries its stable `[<id>]`; disabled ones show `⏸ disabled` and hide their tools; closed by a folding-health footer |
+| `/mcp list <name>` | `<name>` matching a server → that server's full tool list (a disabled server adds a `⏸` note); matching a full tool name → full description + complete input schema |
+| `/mcp config` | The effective `prefix` / `keep` / `servers` / `descriptionLimit`, each with its hitting tools, plus the persistent enable/disable inventory |
+| `/mcp disable <id>` | Latch a whole server off: its tools force-fold out of every prompt — keep and `servers` exemptions included — it disappears from the `mcp_list` catalog, and `mcp_call` refuses it with an `/mcp enable <id>` hint |
+| `/mcp enable <id>` | Restore it under the same stable id |
 
-Any other form answers with usage. Status is **two-state by design**: a server appears when its tools are visible in your scope — absence does not prove it is disabled (it may be reconnecting); the official client exposes no connection state. The footer reads `meta-tools: mcp_list/mcp_call live · folding ACTIVE — folded N, kept M · ~X chars of schema out of prompt` while the meta-tools are live and at least one tool folds, degrading to a fail-open (or nothing-to-fold) notice otherwise. X counts raw JSON-schema characters, deliberately not tokens. Output beyond 400 lines is truncated with a hint to narrow via `/mcp list <server>`.
+Any other form answers with usage. Every server observed by `/mcp` gets a stable numeric id (`1..99`, smallest free first), persisted in the dsh settings service under the `mcp-adapter:` section of your settings file (`~/.dsh/settings.yaml` on a stock install). Ids survive restarts and re-sync gaps and are never recycled — an id always names the same server; when all 99 are taken the toggle forms say so explicitly.
+
+Disable is **gate-style, not a disconnect**: the official client exposes no disconnect API, so tools stay registered and connections keep running — gating only removes them from the prompt, the catalog, and dispatch. All three latches judge through one shared verdict, so they can never disagree with each other or with what `/mcp` displays. Enable/disable persist through the settings service; without one everything still works and only the toggles answer with an explanatory error.
+
+Status remains **two-state**: a server appears when its tools are visible in your scope — absence does not prove it is disabled (it may be reconnecting); the official client exposes no connection state. The footer reads `meta-tools: mcp_list/mcp_call live · folding ACTIVE — folded N, kept M · ~X chars of schema out of prompt` while the meta-tools are live and at least one tool folds, degrading to a fail-open (or nothing-to-fold) notice otherwise. X counts raw JSON-schema characters, deliberately not tokens. Output beyond 400 lines is truncated with a hint to narrow via `/mcp list <server>`.
 
 ## Acknowledgments
 

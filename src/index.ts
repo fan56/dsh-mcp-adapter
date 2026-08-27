@@ -28,7 +28,13 @@
  * A read-only `/mcp` slash command (platform `commands` service) surfaces the
  * live state human-side: the server/tool tree, per-server/per-tool details,
  * the effective configuration, and whether folding is active, idle, or in
- * fail-open passthrough.
+ * fail-open passthrough. The same command carries the one mutating surface:
+ * `/mcp disable <id>` / `/mcp enable <id>` gate a whole server behind all
+ * three latches at once — its tools force-fold out of every prompt (keep and
+ * `servers` whitelist exemptions included), it disappears from the catalog,
+ * and `mcp_call` refuses it with an enable hint. Each server gets a stable
+ * numeric id (1..99, smallest free first) persisted in the dsh settings
+ * service (`mcp-adapter` namespace), so ids survive restarts and re-syncs.
  *
  * Child-owned projections are preserved: `mcp_call` delegates its
  * `output.render` to the dispatched child and forwards the child's
@@ -52,11 +58,17 @@ import z from '@deepseek-ai/schemastery'
 import type { ContentBlock, ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition, ToolExecution, ToolExecutionResult, JsonValue } from '@deepseek-ai/dsh-tools'
 import type { ScopeKey } from '@deepseek-ai/dsh-scope'
-// Side-effect type imports: declaration-merge the `tools` and `commands`
-// services onto Context and the `system-prompt/assemble` waterfall onto Events.
+// Side-effect type imports: declaration-merge the `tools`, `commands` and
+// `settings` services onto Context and the `system-prompt/assemble` waterfall
+// onto Events.
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-commands'
+// `settingsNamespace` is the one RUNTIME import from dsh-settings: cheap
+// kebab-case validation of our namespace string at module load.
+import { settingsNamespace } from '@deepseek-ai/dsh-settings'
+import type { SettingsNamespace, SettingsScope } from '@deepseek-ai/dsh-settings'
+import type {} from '@deepseek-ai/dsh-settings'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'mcp-adapter'
@@ -84,6 +96,184 @@ const DEFAULT_PREFIX = 'mcp__'
 
 /** Valid fold prefix: non-empty, tool-name characters only. */
 const PREFIX_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
+
+// ---- Server enable/disable (pure) ----
+
+/** Upper bound of the stable per-server id space. */
+export const MCP_SERVER_ID_LIMIT = 99
+
+/** dsh settings namespace persisting the stable ids and the disabled set. */
+export const MCP_ADAPTER_SETTINGS_NAMESPACE: SettingsNamespace = settingsNamespace('mcp-adapter')
+
+/**
+ * The persisted gate state (one settings section). `serverIds` maps every
+ * OBSERVED server name to its stable id and is never pruned — enable/disable
+ * never recycles an id, so an id always means the same server, even across
+ * restarts and temporary re-sync gaps.
+ */
+export interface ServerIdRegistry {
+  /** Observed server name -> stable id (1..99), assigned smallest-free-first. */
+  serverIds: Record<string, number>
+  /** Ids currently gated off; entries whose mapping exists nowhere are inert. */
+  disabled: number[]
+}
+
+/**
+ * Read-side snapshot of the registry the three latches consult. Structurally
+ * a superset of {@link ServerIdRegistry}; everything (config objects included)
+ * shaped like this qualifies, so production hands frozen `scope.get()` values
+ * straight in.
+ */
+export interface ServerGateState {
+  readonly serverIds: Readonly<Record<string, number>>
+  readonly disabled: readonly number[]
+}
+
+/** Gate snapshot meaning "nothing observed, nothing disabled". */
+export const EMPTY_SERVER_GATE: ServerGateState = { serverIds: {}, disabled: [] }
+
+/** Schema of the persisted `mcp-adapter` settings section. */
+export const SERVER_ID_REGISTRY_SCHEMA = z.object({
+  serverIds: z.dict(z.number().step(1).min(1).max(MCP_SERVER_ID_LIMIT)).default({}),
+  disabled: z.array(z.number().step(1).min(1).max(MCP_SERVER_ID_LIMIT)).default([]),
+}) as unknown as z<ServerIdRegistry>
+
+/** Whether one number is an allocatable server id. */
+function isValidServerId(id: unknown): id is number {
+  return typeof id === 'number' && Number.isInteger(id) && id >= 1 && id <= MCP_SERVER_ID_LIMIT
+}
+
+/**
+ * Coerce any resolved settings value into a trustworthy gate snapshot. The
+ * schema already validates at resolve time, but every latch judges from THIS
+ * function's output, so corrupt or hand-edited documents degrade to "some
+ * entries ignored" instead of wedging folding or dispatch.
+ */
+export function normalizeServerGate(raw: unknown): ServerGateState {
+  if (typeof raw !== 'object' || raw === null) return EMPTY_SERVER_GATE
+  const rawIds = (raw as { serverIds?: unknown }).serverIds
+  const rawDisabled = (raw as { disabled?: unknown }).disabled
+  // One id must name exactly one server: on duplicate ids first mapping wins.
+  const taken = new Set<number>()
+  const serverIds: Record<string, number> = {}
+  if (typeof rawIds === 'object' && rawIds !== null && !Array.isArray(rawIds)) {
+    for (const [name, id] of Object.entries(rawIds as Record<string, unknown>)) {
+      if (name !== '' && isValidServerId(id) && !taken.has(id)) {
+        taken.add(id)
+        serverIds[name] = id
+      }
+    }
+  }
+  const seen = new Set<number>()
+  const disabled: number[] = []
+  if (Array.isArray(rawDisabled)) {
+    for (const entry of rawDisabled) {
+      if (isValidServerId(entry) && !seen.has(entry)) {
+        seen.add(entry)
+        disabled.push(entry)
+      }
+    }
+  }
+  return { serverIds, disabled }
+}
+
+/**
+ * THE shared disabled verdict — all three latches (waterfall fold, catalog,
+ * mcp_call dispatch) and every /mcp renderer judge through this one function,
+ * so the gating can never disagree with itself. An unmapped server (or an
+ * absent snapshot, or the degenerate empty server segment) is ENABLED:
+ * gating requires positive evidence, keeping fail-open direction.
+ */
+export function isServerDisabled(server: string, gate?: ServerGateState): boolean {
+  if (gate === undefined || server === '') return false
+  const id = gate.serverIds[server]
+  return id !== undefined && gate.disabled.includes(id)
+}
+
+/** Outcome of {@link allocateMissingServerIds}. */
+export interface ServerIdAllocation {
+  /** Next registry: a fresh object; inputs are never mutated. */
+  registry: ServerIdRegistry
+  /** Servers left unassigned because the 1..99 space ran out. */
+  unassigned: string[]
+  /** Names that received a NEW id in this pass (empty in steady state). */
+  added: string[]
+}
+
+/**
+ * Assign the smallest free id (1..99) to every listed server not yet mapped.
+ * Existing mappings are kept verbatim (id stability across restarts); the
+ * allocation never mutates its input. Call this whenever /mcp observes the
+ * live server set, then persist `{@link ServerIdAllocation.registry}` when
+ * `added` is non-empty.
+ */
+export function allocateMissingServerIds(
+  state: ServerGateState | undefined,
+  servers: readonly string[],
+): ServerIdAllocation {
+  const source = normalizeServerGate(state)
+  const serverIds: Record<string, number> = { ...source.serverIds }
+  // Disabled ids stay burned even when their server vanished from the map
+  // (hand-edited documents): a fresh assignment must never inherit a stale
+  // disabled flag it did not ask for.
+  const used = new Set<number>([...Object.values(serverIds), ...source.disabled])
+  const added: string[] = []
+  const unassigned: string[] = []
+  for (const server of servers) {
+    if (server === '' || serverIds[server] !== undefined) continue
+    let id = 1
+    while (used.has(id)) id += 1
+    if (id > MCP_SERVER_ID_LIMIT) {
+      unassigned.push(server)
+      continue
+    }
+    used.add(id)
+    serverIds[server] = id
+    added.push(server)
+  }
+  return { registry: { serverIds, disabled: [...source.disabled] }, unassigned, added }
+}
+
+/** Reverse lookup: which server (if any) carries this id today. */
+export function serverNameById(registry: ServerGateState | undefined, id: number): string | undefined {
+  if (registry === undefined) return undefined
+  for (const [name, mapped] of Object.entries(registry.serverIds)) {
+    if (mapped === id) return name
+  }
+  return undefined
+}
+
+/** Outcome of {@link setServerDisabledState}. */
+export interface ServerToggleOutcome {
+  /** Next registry (fresh object); unchanged content when nothing applied. */
+  registry: ServerIdRegistry
+  /** Whether the disabled set actually moved. */
+  changed: boolean
+}
+
+/**
+ * Apply one enable/disable toggle for a MAPPED server onto a copy of the
+ * registry. Unmapped servers are no-ops (`changed: false`). Enabling never
+ * removes the id mapping — re-disabling later reuses the same number.
+ */
+export function setServerDisabledState(
+  state: ServerGateState | undefined,
+  server: string,
+  disable: boolean,
+): ServerToggleOutcome {
+  const source = normalizeServerGate(state)
+  const id = source.serverIds[server]
+  const has = id !== undefined && source.disabled.includes(id)
+  // Disable without a mapping (or already disabled) is inert; enable just
+  // filters — both keep the id mapping untouched.
+  const nextDisabled = disable
+    ? id === undefined || has ? [...source.disabled] : [...source.disabled, id].sort((a, b) => a - b)
+    : source.disabled.filter(entry => entry !== id)
+  return {
+    registry: { serverIds: { ...source.serverIds }, disabled: nextDisabled },
+    changed: disable ? id !== undefined && !has : has,
+  }
+}
 
 // ---- Config ----
 
@@ -165,10 +355,16 @@ export function isAllowedServer(name: string, prefix: string, servers: readonly 
  * keep list — and it must never be one of this plugin's own meta-tools,
  * whatever the prefix is configured to (folding them would make every folded
  * MCP tool undiscoverable).
+ *
+ * Gate override: when the tool's server is DISABLED
+ * ({@link isServerDisabled}, shared with catalog/dispatch), its schema folds
+ * OUT regardless of keep patterns or the servers whitelist — disablement is
+ * strictly stronger than any config exemption.
  * @param name - the registered tool name.
  * @param prefix - tool-name prefix to fold.
  * @param keep - keep patterns from config.
  * @param servers - server-name whitelist from config (default: no filtering).
+ * @param gate - live disabled-server snapshot (default/undefined: none).
  * @returns whether the schema leaves the prompt (the tool stays callable).
  */
 export function shouldFold(
@@ -176,10 +372,12 @@ export function shouldFold(
   prefix: string,
   keep: readonly string[],
   servers: readonly string[] = [],
+  gate?: ServerGateState,
 ): boolean {
   if (name === MCP_LIST_TOOL_NAME || name === MCP_CALL_TOOL_NAME) return false
-  return prefix !== '' && name.startsWith(prefix) && !matchesKeep(name, keep)
-    && isAllowedServer(name, prefix, servers)
+  if (prefix === '' || !name.startsWith(prefix)) return false
+  if (isServerDisabled(serverOfToolName(name, prefix), gate)) return true
+  return !matchesKeep(name, keep) && isAllowedServer(name, prefix, servers)
 }
 
 // ---- Assembly folding (pure) ----
@@ -218,17 +416,20 @@ export interface AssemblyWithTools {
  * @param options - folding knobs.
  * @param metaToolsLive - whether both meta-tools currently resolve to this
  *   plugin's own definitions in the assembling scope.
+ * @param gate - live disabled-server snapshot, fresh per assembly (default:
+ *   none disabled).
  * @returns the folded assembly, or the input unchanged when nothing folds.
  */
 export function foldPromptAssembly<T extends AssemblyWithTools>(
   assembly: T,
   options: FoldOptions,
   metaToolsLive: boolean,
+  gate?: ServerGateState,
 ): T {
   if (!metaToolsLive) return assembly
   const servers = options.servers ?? []
   const tools = assembly.tools.filter(
-    tool => !shouldFold(tool.name, options.prefix, options.keep, servers),
+    tool => !shouldFold(tool.name, options.prefix, options.keep, servers, gate),
   )
   if (tools.length === assembly.tools.length) return assembly
   return { ...assembly, tools }
@@ -244,6 +445,12 @@ export interface McpListOptions {
   descriptionLimit: number
   /** Server-name whitelist; empty or omitted admits every server. */
   servers?: readonly string[]
+  /**
+   * Live gate reader (production: fresh `settingsScope.get()` snapshot per
+   * execution). A callback, not a value: the factory is built once at apply
+   * time and must observe later /mcp disable/enable writes.
+   */
+  getGate?: () => ServerGateState | undefined
 }
 
 /** Normalized `mcp_list` arguments. */
@@ -334,12 +541,14 @@ export function truncateDescription(text: string, limit: number): string {
  * @param args - the normalized catalog query.
  * @param schemas - schemas visible to the calling agent.
  * @param options - catalog knobs.
+ * @param gate - live disabled-server snapshot (default: none disabled).
  * @returns the canonical result value.
  */
 export function buildMcpListResult(
   args: McpListArgs,
   schemas: readonly ToolSchema[],
   options: McpListOptions,
+  gate?: ServerGateState,
 ): McpListResult {
   const { prefix, descriptionLimit } = options
   const servers = options.servers ?? []
@@ -356,6 +565,11 @@ export function buildMcpListResult(
     if (!isAllowedServer(args.tool, prefix, servers)) {
       return { error: `"${args.tool}" belongs to server "${serverOfToolName(args.tool, prefix)}", which is not in the configured servers list` }
     }
+    const gatedServer = serverOfToolName(args.tool, prefix)
+    if (isServerDisabled(gatedServer, gate)) {
+      const id = gate?.serverIds[gatedServer]
+      return { error: `refusing to expand "${args.tool}": server "${gatedServer}" is disabled — it can be restored with "/mcp enable ${String(id)}"` }
+    }
     const schema = schemas.find(candidate => candidate.name === args.tool)
     if (schema === undefined) {
       return { error: `unknown MCP tool "${args.tool}" — the server may have re-synced; call ${MCP_LIST_TOOL_NAME} to refresh` }
@@ -371,6 +585,9 @@ export function buildMcpListResult(
     if (!schema.name.startsWith(prefix)) continue
     if (!isAllowedServer(schema.name, prefix, servers)) continue
     const server = serverOfToolName(schema.name, prefix)
+    // Disabled servers vanish from the directory entirely; point-name
+    // expansion above remains the structured way to learn why.
+    if (isServerDisabled(server, gate)) continue
     if (args.server !== undefined && server !== args.server) continue
     let group = serversOut.find(entry => entry.server === server)
     if (group === undefined) {
@@ -384,6 +601,10 @@ export function buildMcpListResult(
     })
   }
   if (serversOut.length === 0) {
+    if (args.server !== undefined && isServerDisabled(args.server, gate)) {
+      const id = gate?.serverIds[args.server]
+      return { error: `server "${args.server}" is disabled and hidden from the catalog — restore it with "/mcp enable ${String(id)}"` }
+    }
     return args.server === undefined
       ? { error: `no MCP tools are registered under the "${prefix}" prefix` }
       : { error: `no MCP tools match server "${args.server}"` }
@@ -432,6 +653,10 @@ export interface DispatchableTool<E> {
  * @param resolve - scope-aware tool resolver (production: `ctx.tools.get`).
  * @param exec - the meta-tool's run context, forwarded to the child.
  * @param servers - server-name whitelist (default: no filtering).
+ * @param gate - live disabled-server snapshot (default: none disabled). The
+ *   disabled branch sits after the prefix/whitelist validation: a disabled
+ *   server's tools are refused with an explicit `/mcp enable <id>` hint
+ *   before the child is ever resolved.
  * @returns the child's resolved value verbatim, or a structured error.
  */
 export async function dispatchMcpCall<E>(
@@ -440,6 +665,7 @@ export async function dispatchMcpCall<E>(
   resolve: (name: string) => DispatchableTool<E> | undefined,
   exec: E,
   servers: readonly string[] = [],
+  gate?: ServerGateState,
 ): Promise<unknown> {
   if (typeof args !== 'object' || args === null || Array.isArray(args)) {
     return { error: `${MCP_CALL_TOOL_NAME} expects an object { "tool": string, "arguments"?: object }` }
@@ -457,6 +683,11 @@ export async function dispatchMcpCall<E>(
   }
   if (!isAllowedServer(tool, prefix, servers)) {
     return { error: `refusing to call "${tool}": server "${serverOfToolName(tool, prefix)}" is not in the configured servers list` }
+  }
+  const gatedServer = serverOfToolName(tool, prefix)
+  if (isServerDisabled(gatedServer, gate)) {
+    const id = gate?.serverIds[gatedServer]
+    return { error: `refusing to call "${tool}": server "${gatedServer}" is disabled — ask the operator to run "/mcp enable ${String(id)}" to restore it` }
   }
   const definition = resolve(tool)
   if (definition === undefined) {
@@ -511,11 +742,18 @@ export interface McpCommandOptions {
   servers?: readonly string[]
   /** Max chars per tool description in rendered listings. */
   descriptionLimit: number
+  /**
+   * Live-resolved gate snapshot at invocation time (undefined = the settings
+   * service is not composed, so ids/toggles are absent from all views and
+   * everything renders enabled). A snapshot per invocation keeps these
+   * renderers pure and never stale within one command execution.
+   */
+  gate?: ServerGateState
 }
 
 /** Usage text returned for unparseable /mcp invocations. */
 export const MCP_COMMAND_USAGE = [
-  'Usage: /mcp [list [server|tool] | config]',
+  'Usage: /mcp [list [server|tool] | config | disable <id> | enable <id>]',
   '',
   '/mcp               tree of MCP servers and tools, plus folding health',
   '/mcp list          same as /mcp',
@@ -524,6 +762,10 @@ export const MCP_COMMAND_USAGE = [
   '                   server name or a full registered tool name)',
   '/mcp config        effective adapter configuration with per-pattern and',
   '                   per-server tool matches (read-only)',
+  '/mcp disable <id>  fold one server\'s tools out of every prompt until it is',
+  '                   enabled again (<id> is the stable number shown by "/mcp";',
+  '                   keep and servers exemptions included)',
+  '/mcp enable <id>   restore a disabled server under the same stable id',
 ].join('\n')
 
 /** One parsed /mcp invocation. */
@@ -531,13 +773,21 @@ export type ParsedMcpCommandInput =
   | { form: 'overview' }
   | { form: 'detail'; name: string }
   | { form: 'config' }
+  | { form: 'disable'; id: number }
+  | { form: 'enable'; id: number }
   | { form: 'usage' }
+
+/** Parse one positive integer token (`1`..); anything else is undefined. */
+function parsePositiveInt(token: string): number | undefined {
+  return /^[1-9][0-9]*$/.test(token) ? Number(token) : undefined
+}
 
 /**
  * Parse one /mcp raw input into its form. `''` and `'list'` are the tree
  * overview; `'list <name>'` is a server/tool detail; `'config'` shows the
- * effective configuration. Everything else — including `list` with more than
- * one argument and `config` with any argument — parses to the usage error.
+ * effective configuration; `'disable <n>'` / `'enable <n>'` are whole-server
+ * toggles (n is the stable id shown by `/mcp`, so a bare `0` or non-numeric
+ * token is already usage). Everything else parses to the usage error.
  * @param rawInput - exact text following the command name.
  * @returns the normalized command form.
  */
@@ -552,6 +802,11 @@ export function parseMcpCommandInput(rawInput: string): ParsedMcpCommandInput {
       return { form: 'usage' }
     case 'config':
       return parts.length === 1 ? { form: 'config' } : { form: 'usage' }
+    case 'disable':
+    case 'enable': {
+      const id = parts.length === 2 ? parsePositiveInt(parts[1]) : undefined
+      return id === undefined ? { form: 'usage' } : { form: parts[0] as 'disable' | 'enable', id }
+    }
     default:
       return { form: 'usage' }
   }
@@ -572,6 +827,25 @@ function mcpCommandCandidates(
     && schema.name.startsWith(options.prefix)
     && isAllowedServer(schema.name, options.prefix, servers),
   )
+}
+
+/**
+ * Distinct server names among one view's candidates, in first-seen order —
+ * the live set stable ids are allocated against.
+ */
+export function liveServerNames(
+  schemas: readonly ToolSchema[],
+  options: Pick<McpCommandOptions, 'prefix' | 'servers'>,
+): string[] {
+  const seen = new Set<string>()
+  const names: string[] = []
+  for (const schema of mcpCommandCandidates(schemas, options)) {
+    const server = serverOfToolName(schema.name, options.prefix)
+    if (server === '' || seen.has(server)) continue
+    seen.add(server)
+    names.push(server)
+  }
+  return names
 }
 
 /** Three-state folding health of the /mcp overview footer. */
@@ -601,7 +875,8 @@ export interface McpHealthStats {
  * nothing to fold is the idle state; not-live is fail-open.
  *
  * @param schemas - schemas visible to the receiving agent.
- * @param options - adapter knobs (prefix/keep/servers).
+ * @param options - adapter knobs (prefix/keep/servers) plus the live gate
+ *   snapshot (`gate`) when the settings service is composed.
  * @param metaToolsLive - whether both meta-tools resolve to this plugin's
  *   definitions in the receiving agent's scope.
  * @returns the folding health plus the partition behind it.
@@ -620,7 +895,7 @@ export function collectMcpHealth(
     if (schema.name === MCP_LIST_TOOL_NAME || schema.name === MCP_CALL_TOOL_NAME) continue
     if (!schema.name.startsWith(options.prefix)) continue
     matched += 1
-    if (shouldFold(schema.name, options.prefix, options.keep, servers)) folded.push(schema)
+    if (shouldFold(schema.name, options.prefix, options.keep, servers, options.gate)) folded.push(schema)
     else kept.push(schema)
   }
   if (folded.length === 0) return { stats: { folded, kept }, health: { state: 'idle', matched } }
@@ -659,6 +934,25 @@ export function renderMcpHealthLine(health: McpFoldingHealth): string {
 export interface McpServerGroup {
   server: string
   schemas: ToolSchema[]
+}
+
+/**
+ * Header line of one server group in the tree views. Without a gate snapshot
+ * the line is the plain legacy form (`name (n)`); with one, every group is
+ * prefixed by its stable id — `[1] fs (4)` — and a DISABLED group renders as
+ * `[2] gh ⏸ disabled — hides 3 tool(s)` and lists no tools at all.
+ */
+export function renderServerGroupHeader(
+  group: Pick<McpServerGroup, 'server' | 'schemas'>,
+  gate?: ServerGateState,
+): string {
+  if (gate === undefined) return `${group.server} (${group.schemas.length})`
+  const id = gate.serverIds[group.server]
+  const label = `[${id === undefined ? '-' : String(id)}] ${group.server}`
+  if (isServerDisabled(group.server, gate)) {
+    return `${label} ⏸ disabled — hides ${group.schemas.length} tool(s)`
+  }
+  return `${label} (${group.schemas.length})`
 }
 
 /**
@@ -702,10 +996,11 @@ export function capRenderedLines(text: string, limit: number = MCP_OUTPUT_LINE_L
 
 /**
  * Render the `/mcp` / `/mcp list` tree overview: one block per server with
- * each tool's name and truncated description, closed by the folding-health
- * footer line. Output is line-capped defensively.
+ * each tool's name and truncated description (disabled servers show only a
+ * `⏸ disabled` header line — their tools are hidden), closed by the
+ * folding-health footer line. Output is line-capped defensively.
  * @param schemas - schemas visible to the receiving agent.
- * @param options - adapter knobs (prefix/keep/servers/descriptionLimit).
+ * @param options - adapter knobs (prefix/keep/servers/descriptionLimit/gate).
  * @param metaToolsLive - whether both meta-tools are live in that scope.
  * @returns the complete overview text.
  */
@@ -718,7 +1013,8 @@ export function renderMcpOverview(
   const total = groups.reduce((sum, group) => sum + group.schemas.length, 0)
   const lines = [`MCP servers/tools — ${total} tool(s) across ${groups.length} server(s)`]
   for (const group of groups) {
-    lines.push('', `${group.server} (${group.schemas.length})`)
+    lines.push('', renderServerGroupHeader(group, options.gate))
+    if (isServerDisabled(group.server, options.gate)) continue
     group.schemas.forEach((schema, index) => {
       const connector = index === group.schemas.length - 1 ? '└─' : '├─'
       const description = truncateDescription(schema.description, options.descriptionLimit)
@@ -764,10 +1060,12 @@ export interface McpDetailView {
  * Render `/mcp list <name>`: for a server, its full tool list (names +
  * truncated descriptions); for a single tool, the FULL untruncated
  * description plus the complete input schema. Unknown names produce a
- * descriptive miss rather than generic usage.
+ * descriptive miss rather than generic usage. Human inspection is never
+ * gated, but a target belonging to a disabled server says so — with its
+ * `/mcp enable <id>` hint.
  * @param name - the requested server or tool name.
  * @param schemas - schemas visible to the receiving agent.
- * @param options - adapter knobs (prefix/keep/servers/descriptionLimit).
+ * @param options - adapter knobs (prefix/keep/servers/descriptionLimit/gate).
  * @returns the rendered view.
  */
 export function renderMcpDetail(
@@ -784,6 +1082,10 @@ export function renderMcpDetail(
   }
   if (target.kind === 'server') {
     const lines = [`server "${target.server}" — ${target.schemas.length} tool(s)`]
+    if (isServerDisabled(target.server, options.gate)) {
+      const id = options.gate?.serverIds[target.server]
+      lines.push(`⏸ this server is disabled — its tools are folded out of every prompt; restore with "/mcp enable ${String(id)}"`)
+    }
     target.schemas.forEach((schema, index) => {
       const connector = index === target.schemas.length - 1 ? '└─' : '├─'
       const description = truncateDescription(schema.description, options.descriptionLimit)
@@ -795,12 +1097,12 @@ export function renderMcpDetail(
   const parameters = target.schema.parameters === undefined
     ? '(none)'
     : JSON.stringify(target.schema.parameters, null, 2)
-  return {
-    outcome: 'tool',
-    text: capRenderedLines(
-      `${target.schema.name} (server: ${server})\n\n${target.schema.description}\n\ninputSchema:\n${parameters}`,
-    ),
+  let text = `${target.schema.name} (server: ${server})\n\n${target.schema.description}\n\ninputSchema:\n${parameters}`
+  if (isServerDisabled(server, options.gate)) {
+    const id = options.gate?.serverIds[server]
+    text += `\n\nnote: server "${server}" is disabled — restore it with "/mcp enable ${String(id)}"`
   }
+  return { outcome: 'tool', text: capRenderedLines(text) }
 }
 
 /**
@@ -837,6 +1139,20 @@ export function renderMcpConfig(schemas: readonly ToolSchema[], options: McpComm
     const hits = candidates.filter(schema => serverOfToolName(schema.name, options.prefix) === server)
     lines.push(`  - ${server}`, hits.length === 0 ? '      (no matching tools)' : `      tools: ${hits.map(schema => schema.name).join(', ')}`)
   }
+  // Persistent gate inventory — only meaningful with a live settings-backed
+  // snapshot, so absent snapshots keep the legacy output untouched.
+  if (options.gate !== undefined) {
+    const mapped = Object.entries(options.gate.serverIds).sort((left, right) => left[1] - right[1])
+    lines.push('', 'persistent enable/disable (stable ids; survives restarts):')
+    if (mapped.length === 0) {
+      lines.push('  (no servers observed yet — ids appear the first time "/mcp" sees them)')
+    }
+    for (const [server, id] of mapped) {
+      lines.push(isServerDisabled(server, options.gate)
+        ? `  - [${id}] ${server} ⏸ disabled`
+        : `  - [${id}] ${server}`)
+    }
+  }
   return capRenderedLines(lines.join('\n'))
 }
 
@@ -848,10 +1164,23 @@ export interface McpCommandView {
   rawInput: string
   /** Schemas visible to the receiving agent (`ctx.tools.schemas(scope)`). */
   schemas: readonly ToolSchema[]
-  /** Effective adapter knobs. */
+  /** Effective adapter knobs plus the invocation-time gate snapshot (`gate`). */
   config: McpCommandOptions
   /** Whether both meta-tools resolve to this plugin's definitions there. */
   metaToolsLive: boolean
+  /**
+   * Gate snapshot resolved when the invocation started; `undefined` means the
+   * dsh settings service is not composed in this process (stable ids and
+   * toggles are unavailable; views degrade to enabled-everything).
+   */
+  gate?: ServerGateState
+  /**
+   * Persist one complete next registry (production: a wholesale `replace` of
+   * the `mcp-adapter` settings section, mirroring agent-default-model's
+   * save-selection precedent). Absent ⇒ /mcp disable/enable answers with an
+   * explanatory error instead of silently dropping the intent.
+   */
+  writeGate?: (next: ServerIdRegistry) => Promise<void>
 }
 
 /** CommandResult-compatible outcome (platform shape: success may omit text). */
@@ -861,26 +1190,102 @@ export interface McpCommandOutcome {
 }
 
 /**
- * Execute one /mcp invocation over plain data: parse the raw input, then
- * dispatch to the matching pure renderer. Unknown forms return the usage
- * error; an unknown detail target returns a descriptive error — nothing here
- * ever mutates state (the command is strictly read-only).
+ * Execute one /mcp invocation over plain data. Read forms stay side-effect-
+ * free except for stable-id bookkeeping: any form that displays ids ensures
+ * every newly observed server has one and persists fresh assignments through
+ * `writeGate` (best-effort — a failed persistence still renders, ids merely
+ * reallocate identically next time). The mutating forms validate their target
+ * against the LIVE server set, then persist one combined write (allocations +
+ * toggle); every failure surfaces as a structured `{ kind: 'error', text }`
+ * outcome, never a throw.
+ *
  * @param view - the invocation's resolved inputs.
  * @returns a platform-shaped command outcome.
  */
-export function executeMcpCommand(view: McpCommandView): McpCommandOutcome {
+export async function executeMcpCommand(view: McpCommandView): Promise<McpCommandOutcome> {
   const parsed = parseMcpCommandInput(view.rawInput)
+  const { config } = view
+
+  // Toggle-free fast path: usage needs neither ids nor persistence.
+  if (parsed.form === 'usage') return { kind: 'error', text: MCP_COMMAND_USAGE }
+
+  // Stable-id observation point: whatever this invocation can see gets its
+  // persistent id now (only when gating is actually wired). Failures keep the
+  // local assignment for this render and simply re-run deterministically.
+  let effectiveView: McpCommandView = view
+  let registry: ServerIdRegistry | undefined
+  if (view.gate !== undefined && view.writeGate !== undefined) {
+    const allocation = allocateMissingServerIds(view.gate, liveServerNames(view.schemas, config))
+    registry = allocation.registry
+    if (allocation.added.length > 0) {
+      try {
+        await view.writeGate(registry)
+      } catch {
+        // Persistence failures must not block a status query.
+      }
+    }
+    effectiveView = { ...view, config: { ...config, gate: registry } }
+  }
   switch (parsed.form) {
     case 'overview':
-      return { kind: 'success', text: renderMcpOverview(view.schemas, view.config, view.metaToolsLive) }
+      return { kind: 'success', text: renderMcpOverview(effectiveView.schemas, effectiveView.config, effectiveView.metaToolsLive) }
     case 'detail': {
-      const rendered = renderMcpDetail(parsed.name, view.schemas, view.config)
+      const rendered = renderMcpDetail(parsed.name, effectiveView.schemas, effectiveView.config)
       return { kind: rendered.outcome === 'unknown' ? 'error' : 'success', text: rendered.text }
     }
     case 'config':
-      return { kind: 'success', text: renderMcpConfig(view.schemas, view.config) }
-    case 'usage':
-      return { kind: 'error', text: MCP_COMMAND_USAGE }
+      return { kind: 'success', text: renderMcpConfig(effectiveView.schemas, effectiveView.config) }
+    case 'disable':
+    case 'enable':
+      return runServerToggle(parsed.form, parsed.id, registry, effectiveView)
+  }
+}
+
+/** Execute one validated /mcp disable|enable against the ensured registry. */
+async function runServerToggle(
+  form: 'disable' | 'enable',
+  id: number,
+  registry: ServerIdRegistry | undefined,
+  view: McpCommandView,
+): Promise<McpCommandOutcome> {
+  const wantDisable = form === 'disable'
+  if (registry === undefined || view.writeGate === undefined) {
+    return {
+      kind: 'error',
+      text: `"/mcp ${form}" needs the dsh settings service to persist server state, `
+        + 'and it is not composed in this process',
+    }
+  }
+  const liveServers = new Set(liveServerNames(view.schemas, view.config))
+  const server = serverNameById(registry, id)
+  if (server === undefined || !liveServers.has(server)) {
+    const why = server === undefined
+      ? `no live MCP server carries id ${id}`
+      : `"${server}" carries id ${id} but has no visible tools in this scope right now`
+    return { kind: 'error', text: `${why} — run "/mcp" for the assigned ids\n\n${MCP_COMMAND_USAGE}` }
+  }
+  const toggle = setServerDisabledState(registry, server, wantDisable)
+  if (!toggle.changed) {
+    return {
+      kind: 'success',
+      text: wantDisable
+        ? `server "${server}" (id ${id}) is already disabled — nothing changed ("/mcp enable ${id}" restores it)`
+        : `server "${server}" (id ${id}) is not disabled — nothing changed`,
+    }
+  }
+  try {
+    await view.writeGate(toggle.registry)
+  } catch (error) {
+    return {
+      kind: 'error',
+      text: `"/mcp ${form} ${id}" could not be persisted: ${error instanceof Error ? error.message : String(error)} — state unchanged`,
+    }
+  }
+  return {
+    kind: 'success',
+    text: wantDisable
+      ? `server "${server}" (id ${id}) disabled — its tools fold out of every prompt until "/mcp enable ${id}"`
+      : `server "${server}" (id ${id}) enabled — back to normal folding/catalog/dispatch under the same id`,
   }
 }
 
@@ -1061,7 +1466,7 @@ export function createMcpListTool(
       const query = normalizeMcpListArgs(args)
       // The calling agent's view: restricted-away tools stay out of the catalog.
       const schemas = listSchemas(exec.agent)
-      return Promise.resolve(buildMcpListResult(query, schemas, options))
+      return Promise.resolve(buildMcpListResult(query, schemas, options, options.getGate?.()))
     },
   }
 }
@@ -1072,12 +1477,17 @@ export function createMcpListTool(
  * @param resolve - scope-aware definition resolver (production:
  *   `ctx.tools.get`, called with the calling agent).
  * @param servers - server-name whitelist (default: no filtering).
+ * @param getGate - live disabled-server reader (production: fresh
+ *   `settingsScope.get()` snapshot per dispatch; default/omitted: nothing is
+ *   disabled). Deliberately a callback — the definition object outlives any
+ *   one settings snapshot and must observe later /mcp enable/disable writes.
  * @returns the complete tool definition.
  */
 export function createMcpCallTool(
   prefix: string,
   resolve: (name: string, scope?: ScopeKey) => ToolDefinition | undefined,
   servers: readonly string[] = [],
+  getGate?: () => ServerGateState | undefined,
 ): ToolDefinition {
   return {
     name: MCP_CALL_TOOL_NAME,
@@ -1107,7 +1517,7 @@ export function createMcpCallTool(
         renderDispatched(args, value, name => resolve(name)),
     },
     execute: (args: unknown, exec) =>
-      dispatchMcpCall(args, prefix, name => resolve(name, exec.agent), exec, servers),
+      dispatchMcpCall(args, prefix, name => resolve(name, exec.agent), exec, servers, getGate?.()),
     // Restore child-owned projections (image attachments): the registry
     // invokes THIS definition's finalizer, so it must forward to the child's
     // with the same exec object dispatch passed to child.execute.
@@ -1125,6 +1535,12 @@ export function createMcpCallTool(
  * both registrations are rolled back, a warning is logged, and NO listener
  * is installed — the official full-schema passthrough stays intact.
  *
+ * Server gating: when a dsh settings service is composed, the `mcp-adapter`
+ * namespace is registered on it and every gate consumer reads FRESH resolved
+ * values through small callbacks — the plugin keeps no in-memory copy that
+ * could drift from settings. Without settings everything still works; only
+ * `/mcp disable`/`enable` answer with an explanatory error.
+ *
  * @param ctx - plugin context carrying the tool registry.
  * @param config - resolved adapter configuration.
  */
@@ -1140,11 +1556,39 @@ export function apply(ctx: Context, config: AdapterConfig): void {
     servers: config.servers,
   }
 
-  const listDefinition = createMcpListTool(listOptions, scope => ctx.tools.schemas(scope))
+  // Optional settings consumption (the canonical inject-scoped pattern): the
+  // registration rides its own child fiber, so disposing it removes exactly
+  // the namespace. Late binding over `settingsScope` means the meta-tools,
+  // waterfall, and command created below observe the mount whenever it lands.
+  let settingsScope: SettingsScope<ServerIdRegistry> | undefined
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['settings'], (sctx) => {
+      settingsScope = sctx.settings.register(MCP_ADAPTER_SETTINGS_NAMESPACE, SERVER_ID_REGISTRY_SCHEMA)
+      return () => { settingsScope = undefined }
+    })
+  }
+  // Fresh snapshot per read; normalize guards hand-edited documents. The
+  // scope being absent is distinguishable from an empty section: undefined
+  // propagates so toggle commands can name their missing dependency.
+  const getGate = (): ServerGateState | undefined =>
+    settingsScope === undefined ? undefined : normalizeServerGate(settingsScope.get())
+  const writeGate = async (next: ServerIdRegistry): Promise<void> => {
+    const scope = settingsScope
+    if (scope === undefined) throw new Error('settings service went away before the write')
+    // Wholesale replace (not update): we always hold the complete next
+    // section, and replace cannot merge stale keys back under us.
+    await scope.replace({ serverIds: { ...next.serverIds }, disabled: [...next.disabled] })
+  }
+
+  const listDefinition = createMcpListTool(
+    { ...listOptions, getGate },
+    scope => ctx.tools.schemas(scope),
+  )
   const callDefinition = createMcpCallTool(
     config.prefix,
     (name, scope) => ctx.tools.get(name, scope),
     config.servers,
+    getGate,
   )
 
   const disposers: Array<() => void> = []
@@ -1174,23 +1618,17 @@ export function apply(ctx: Context, config: AdapterConfig): void {
     // missing, shadowed, or foreign `mcp_list`/`mcp_call` means passthrough.
     const metaToolsLive = ctx.tools.get(MCP_LIST_TOOL_NAME, context.scope) === listDefinition
       && ctx.tools.get(MCP_CALL_TOOL_NAME, context.scope) === callDefinition
-    return foldPromptAssembly(assembled, foldOptions, metaToolsLive)
+    return foldPromptAssembly(assembled, foldOptions, metaToolsLive, getGate())
   })
 
-  // Read-only status command on the platform command service (visible in TUI
+  // Status + server toggles on the platform command service (visible in TUI
   // completion and web slash panels). Orthogonal to folding: a name conflict
   // here must not disable the meta-tools, so it degrades independently.
-  const commandOptions: McpCommandOptions = {
-    prefix: config.prefix,
-    keep: config.keep,
-    servers: config.servers,
-    descriptionLimit: config.descriptionLimit,
-  }
   try {
     const commandDisposer = ctx.commands.register({
       name: MCP_COMMAND_NAME,
-      description: 'Show MCP server/tool status (read-only)',
-      input: { hint: '[list [server|tool] | config]' },
+      description: 'Show MCP status; disable/enable MCP servers',
+      input: { hint: '[list [server|tool] | config | disable <id> | enable <id>]' },
       handler: invocation => {
         // The receiving agent's restricted view; an absent agent degrades to
         // the global registry view (`schemas()` without scope).
@@ -1198,7 +1636,20 @@ export function apply(ctx: Context, config: AdapterConfig): void {
         const schemas = ctx.tools.schemas(scope)
         const metaToolsLive = ctx.tools.get(MCP_LIST_TOOL_NAME, scope) === listDefinition
           && ctx.tools.get(MCP_CALL_TOOL_NAME, scope) === callDefinition
-        return executeMcpCommand({ rawInput: invocation.rawInput, schemas, config: commandOptions, metaToolsLive })
+        return executeMcpCommand({
+          rawInput: invocation.rawInput,
+          schemas,
+          config: {
+            prefix: config.prefix,
+            keep: config.keep,
+            servers: config.servers,
+            descriptionLimit: config.descriptionLimit,
+            gate: getGate(),
+          },
+          metaToolsLive,
+          gate: getGate(),
+          writeGate,
+        })
       },
     })
     ctx.effect(() => commandDisposer, 'mcp-adapter.command')

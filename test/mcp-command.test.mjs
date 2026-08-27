@@ -297,30 +297,30 @@ function runExecute(rawInput, overrides = {}) {
   })
 }
 
-test('execute: overview is a success carrying the tree and the health line', () => {
+test('execute: overview is a success carrying the tree and the health line', async () => {
   for (const rawInput of ['', 'list']) {
-    const outcome = runExecute(rawInput)
+    const outcome = await runExecute(rawInput)
     assert.equal(outcome.kind, 'success')
     assert.match(outcome.text, /MCP servers\/tools/)
     assert.match(outcome.text, /folding ACTIVE/)
   }
 })
 
-test('execute: detail hits are successes, misses are errors referencing the miss', () => {
-  assert.equal(runExecute('list fs').kind, 'success')
-  const miss = runExecute('list ghost')
+test('execute: detail hits are successes, misses are errors referencing the miss', async () => {
+  assert.equal((await runExecute('list fs')).kind, 'success')
+  const miss = await runExecute('list ghost')
   assert.equal(miss.kind, 'error')
   assert.match(miss.text, /no MCP server or tool matches "ghost"/)
 })
 
-test('execute: config succeeds and bad forms return the verbatim usage text', () => {
-  assert.equal(runExecute('config').kind, 'success')
-  const usage = runExecute('make it fold harder')
+test('execute: config succeeds and bad forms return the verbatim usage text', async () => {
+  assert.equal((await runExecute('config')).kind, 'success')
+  const usage = await runExecute('make it fold harder')
   assert.deepEqual(usage, { kind: 'error', text: MCP_COMMAND_USAGE })
 })
 
-test('execute: a fail-open view renders successfully with the INACTIVE notice', () => {
-  const failOpen = runExecute('', { metaToolsLive: false })
+test('execute: a fail-open view renders successfully with the INACTIVE notice', async () => {
+  const failOpen = await runExecute('', { metaToolsLive: false })
   assert.equal(failOpen.kind, 'success')
   assert.match(failOpen.text, /folding INACTIVE \(fail-open\) — full schemas are passing through/)
 })
@@ -328,12 +328,36 @@ test('execute: a fail-open view renders successfully with the INACTIVE notice', 
 // ---- apply() command wiring ----
 
 /**
- * Standalone ctx stub mirroring mcp-adapter.test.mjs's fakeCtx plus the
- * `commands` service, with scope recording and a live-mask hook so the
- * fail-open branch of the command handler can be exercised.
+ * Minimal in-memory settings provider honoring the seam our apply() uses:
+ * register(ns, schema) → scope { get, replace }. The REAL registry schema is
+ * passed through, so resolved values layer defaults exactly like production.
  */
-function stubCtx() {
-  const state = { registered: new Map(), commands: new Map(), effects: [], warnings: [], schemaScopes: [], maskedMeta: false }
+function settingsStub(store) {
+  return {
+    register(ns, schema) {
+      const entry = store.sections[ns] ?? (store.sections[ns] = {})
+      if (entry.resolved === undefined) entry.resolved = schema({})
+      return {
+        get: () => entry.resolved,
+        replace: async (section) => {
+          entry.resolved = schema(section)
+          store.sections[ns].user = section
+          store.writes.push({ ns, section })
+        },
+      }
+    },
+  }
+}
+
+/**
+ * Standalone ctx stub mirroring mcp-adapter.test.mjs's fakeCtx plus the
+ * `commands` service and an optional mounted `settings` service, with scope
+ * recording and a live-mask hook so the fail-open branch of the command
+ * handler can be exercised.
+ */
+function stubCtx({ mountSettings = true } = {}) {
+  const store = { sections: {}, writes: [] }
+  const state = { registered: new Map(), commands: new Map(), effects: [], warnings: [], schemaScopes: [], maskedMeta: false, injections: [], store }
   const ctx = {
     tools: {
       register(definition) {
@@ -359,6 +383,14 @@ function stubCtx() {
         return () => state.commands.delete(definition.name)
       },
     },
+    inject(services, callback) {
+      state.injections.push([...services])
+      let disposer
+      if (mountSettings && services.includes('settings')) {
+        disposer = callback({ settings: settingsStub(store) })
+      }
+      return () => { if (disposer !== undefined) disposer() }
+    },
     on(event, listener) {
       state.listeners = state.listeners ?? []
       state.listeners.push({ event, listener })
@@ -371,17 +403,17 @@ function stubCtx() {
     },
     logger: { warn(message) { state.warnings.push(message) } },
   }
-  return { ctx, state }
+  return { ctx, state, store }
 }
 
-test('apply(): registers the read-only /mcp command with the declared contract', () => {
+test('apply(): registers the /mcp command with the declared contract', () => {
   const { ctx, state } = stubCtx()
   apply(ctx, { ...OPTIONS })
   const definition = state.commands.get('mcp')
   assert.notEqual(definition, undefined)
   assert.equal(definition.name, 'mcp')
-  assert.equal(definition.description, 'Show MCP server/tool status (read-only)')
-  assert.deepEqual(definition.input, { hint: '[list [server|tool] | config]' })
+  assert.equal(definition.description, 'Show MCP status; disable/enable MCP servers')
+  assert.deepEqual(definition.input, { hint: '[list [server|tool] | config | disable <id> | enable <id>]' })
 })
 
 test('apply(): the handler answers from the invoking agent\'s scope, live-aware', async () => {

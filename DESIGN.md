@@ -271,3 +271,53 @@ headless 经 apiproxy 同表可编程调用。**不新增任何配置项**，只
   本插件定义对象；folding active 即该值 AND 至少折叠 >0 个。
 - 渲染上限防御：单次输出行数封顶（如 400 行），超出截断提示用
   `list <server>` 收窄——防止巨型部署刷屏 transcript。
+
+## v0.2.0 追记：/mcp enable/disable（门闩式 server 开关）
+
+2026-08-27 定稿。语义决策：
+
+- **门闩式 disable，非真断连**：官方 dsh-mcp-client 不提供断连或按 server
+  下线的 API。disable 是三层 prompt-side 门闩——
+  a) waterfall fold 强制折叠该 server 全部工具出 prompt（keep 与 `servers`
+     白名单的豁免一并被覆盖：disablement 严格强于任何配置豁免）；
+  b) `mcp_list` 目录不再列出；点名展开返回结构化错误并附 `/mcp enable <id>`；
+  c) `mcp_call` 在 prefix/whitelist 校验之后、resolve 之前拒绝，文案带
+     `/mcp enable <id>` 指引。
+  工具仍留在注册表里（TUI 可见、restrict 不受影响）、连接照旧——只是不再
+  进 prompt / 目录 / 可分发。fail-open（meta-tools 非 live）时门闩随之失效，
+  一切回原生直通——可见性只增不减，方向安全。
+- **三处共用同一判定** `isServerDisabled(server, gate)`：fold、目录过滤、
+  dispatch 拒绝与全部 /mcp 视图都经过这一个函数，口径不可能分叉。meta-tool
+  factory 经 options 回调（`McpListOptions.getGate` /
+  `createMcpCallTool(…, getGate)`）**每次执行**取新鲜快照；waterfall listener
+  与命令 handler 每次调用现读 resolved 值——插件不保存任何会漂移的内存副本，
+  也无全局可变单例。
+- **ID 分配**：`/mcp` 任一形态执行时观测本 scope 的 live server 集合，
+  为首次出现者分配最小空闲 id（1..99）。已分配永不回收——enable 不发新号，
+  映射不做删除 → 重启与 re-sync 空窗下 id 稳定指同一 server。99 用尽：
+  只读视图照常渲染（未分配者显示 `[-]`），toggle 明确报错说明空间耗尽。
+  手工编辑残留的孤儿 disabled id 视作已烧掉（分配跳过），新 server 不会
+  继承别人留下的闸。
+- **持久化**：dsh settings 服务 namespace `mcp-adapter`（kebab-case 经
+  `settingsNamespace()` 校验），section 形如
+  `{ serverIds: Record<server, number>, disabled: number[] }`
+  （`SERVER_ID_REGISTRY_SCHEMA` 给默认 `{}/[]`）。写路径 = 整节
+  `scope.replace(...)`（同上游 agent-default-model `saveSelection` 先例；
+  update 的深合并对映射表语义模糊，replace 无此问题）。判定时直接
+  `scope.get()` 读 resolved 快照。settings 服务缺席：门闩整体禁用、一切照旧，
+  toggle 回 error 说明缺依赖。已知限制：写队列仅进程内串行，两个并发
+  /mcp toggle 是 last-write-wins——人速命令可接受，不引入 revision CAS。
+- **模型面零写入**：`mcp_list`/`mcp_call` 只消费 gate 快照，从不触发
+  settings 写；id 观测/持久化只发生在 /mcp 命令侧（一次观测新增者才有写，
+  稳态零 IO）。
+- **人工视图不受闸**：`/mcp list <name>` 对 disabled server 照样给出工具
+  清单，仅附 ⏸ 行与 enable 指引——检查面与生效面分离，排障不需要先 enable。
+- **settings 消费姿势依据**（上游只读核实）：namespace 注册制
+  `SettingsProvider.register(ns, schema)` 与 owner scope
+  `get/watch/update/replace/mutate`（packages/settings/settings/src/index.ts:435-470,
+  :102-129）、整节 replace 先例（packages/core/agent-default-model/src/index.ts:98-104）、
+  可选服务注入挂载（同文件 installSettingsSection :863-897 的
+  ctx.inject(['settings']) 模式）、host base bundle 挂 settings-file provider
+  （packages/bundle/base/cordis.patch.yml:78-79）、异步 command handler 合法
+  （packages/interaction/commands/src/index.ts:68 `CommandResult |
+  Promise<CommandResult>`）。
