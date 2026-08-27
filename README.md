@@ -81,6 +81,18 @@ config:
 - Coexists with [ben7am1n/dsh-mcp-proxy](https://github.com/ben7am1n/dsh-mcp-proxy) (connection-side proxy with its own servers — different, non-colliding tool names). That project credits pi-mcp-adapter as prior art too; this repo is an independent prompt-side take that reuses the official client instead of re-implementing connections.
 - Trade-offs (same as pi-mcp-adapter): one extra discovery round-trip before the first call, and expanded schemas still occupy context once the model pulls them in.
 
+## Commands
+
+The plugin registers a single **read-only** slash command on the platform `commands` service — `/mcp` shows status, mutates nothing:
+
+| Form | Output |
+|---|---|
+| `/mcp` or `/mcp list` | Tree overview of MCP servers/tools (names + truncated descriptions), closed by a folding-health footer |
+| `/mcp list <name>` | `<name>` matching a server → that server's full tool list; matching a full tool name → full description + complete input schema |
+| `/mcp config` | The effective `prefix` / `keep` / `servers` / `descriptionLimit`, each with its hitting tools |
+
+Any other form answers with usage. Status is **two-state by design**: a server appears when its tools are visible in your scope — absence does not prove it is disabled (it may be reconnecting); the official client exposes no connection state. The footer reads `meta-tools: mcp_list/mcp_call live · folding ACTIVE — folded N, kept M · ~X chars of schema out of prompt` while the meta-tools are live and at least one tool folds, degrading to a fail-open (or nothing-to-fold) notice otherwise. X counts raw JSON-schema characters, deliberately not tokens. Output beyond 400 lines is truncated with a hint to narrow via `/mcp list <server>`.
+
 ## Acknowledgments
 
 With full credit to **[pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter)** by [@nicobailon](https://github.com/nicobailon): the core idea behind this plugin — collapsing an unbounded MCP tool surface into constant meta-tools whose schemas expand on demand, so the standing prompt cost stays O(1) no matter how many servers you run — is entirely theirs, and it reframed what MCP integration should cost. This repository is our port of that idea to DeepSeek Harness; the prompt-side-shim mechanism differs (by design), but the inspiration and the concept belong to the original. If you are on pi, go use theirs.

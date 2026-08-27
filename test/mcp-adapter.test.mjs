@@ -536,7 +536,10 @@ test('mcp_call: output.render delegates to the child render; error wraps and mis
 const BASE_CONFIG = { prefix: 'mcp__', keep: [], servers: [], descriptionLimit: 200 }
 
 function fakeCtx({ failOn } = {}) {
-  const state = { registered: new Map(), listeners: [], effects: [], warnings: [] }
+  const state = {
+    registered: new Map(), listeners: [], effects: [], warnings: [],
+    commands: new Map(),
+  }
   const ctx = {
     tools: {
       register(definition) {
@@ -549,6 +552,13 @@ function fakeCtx({ failOn } = {}) {
         return [...state.registered.values()].map(
           ({ name, description, parameters }) => ({ name, description, parameters }),
         )
+      },
+    },
+    commands: {
+      register(definition) {
+        if (state.commands.has(definition.name)) throw new Error(`name conflict on /${definition.name}`)
+        state.commands.set(definition.name, definition)
+        return () => state.commands.delete(definition.name)
       },
     },
     on(event, listener) {
@@ -584,8 +594,9 @@ test('apply(): registers both meta-tools and folds assemblies through the instal
   const folded = await entries[0].listener(input, { scope: 'agent-1' }, () => Promise.resolve(input))
   assert.deepEqual(folded.tools.map(tool => tool.name), ['read', MCP_LIST_TOOL_NAME, MCP_CALL_TOOL_NAME])
   // Effect-scoped teardown unregisters exactly the meta-tools.
-  assert.equal(state.effects.length, 1)
-  state.effects[0].disposer()
+  const metaToolsEffect = state.effects.find(effect => effect.label === 'mcp-adapter.metaTools')
+  assert.notEqual(metaToolsEffect, undefined)
+  metaToolsEffect.disposer()
   assert.deepEqual([...state.registered.keys()], ['mcp__fs__read_file'])
 })
 
