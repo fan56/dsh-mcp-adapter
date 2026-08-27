@@ -1,5 +1,7 @@
 # dsh-mcp-adapter
 
+English | [简体中文](README.zh.md)
+
 Token-efficient MCP adapter for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) — a **prompt-side shim** inspired by [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter).
 
 ## The problem
@@ -38,7 +40,13 @@ Keep (or add) your `@deepseek-ai/dsh-mcp-client` lines in `cordis.patch.yml`, th
       config: {}
 ```
 
-Install from git while unpublished:
+Install:
+
+```
+dsh plugin --profile <name> add @aiwayds/dsh-mcp-adapter
+```
+
+Or directly from git:
 
 ```
 dsh plugin --profile <name> add github:fan56/dsh-mcp-adapter

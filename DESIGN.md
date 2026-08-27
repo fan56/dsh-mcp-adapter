@@ -8,7 +8,7 @@ pi-mcp-adapter（nicobailon）的理念：MCP 工具的完整 JSON Schema 不该
 **每条请求**都烧 token——无论挂多少 server，prompt 里的常驻工具定义
 应该是 O(1) 的，schema 按需展开。
 
-dsh 上游现状（已核实，`~/github/deepseek-harness`）：
+dsh 上游现状（已核实，[deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)）：
 
 - 官方 `@deepseek-ai/dsh-mcp-client` 是「全量发现 → 每工具完整 schema
   原样注册 → 每请求全量直通」。README 原文承认：
@@ -224,11 +224,11 @@ export interface AdapterConfig {
 
 ## 8. 关键上游参考（实现前必读）
 
-| 读什么 | 位置（~/github/deepseek-harness/） |
+| 读什么 | 位置（上游仓库 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 内相对路径） |
 |---|---|
 | waterfall 事件声明与派发 | packages/core/system-prompt/src/index.ts:18-38, 480-540 |
 | waterfall 订阅先例 | packages/preset/agent-presets/src/invariant.ts |
 | ToolDefinition / ToolRunContext / get / schemas | packages/core/tools/src/index.ts:221-288, 395-425, 1195-1260 |
 | 官方 MCP 工具定义（publicName 规范、execute 闭包、output.render） | packages/mcp/mcp-client/src/tools.ts:111-193, 244-361 |
 | 插件入口 + config schema 风格 | packages/mcp/mcp-client/src/index.ts:1-160 |
-| 模板仓库（scripts/tsconfig/test 风格） | ~/github/dsh-ask-router/ |
+| 模板仓库（scripts/tsconfig/test 风格） | [fan56/dsh-ask-router](https://github.com/fan56/dsh-ask-router) |
