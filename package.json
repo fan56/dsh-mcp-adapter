@@ -2,6 +2,14 @@
   "name": "@aiwayds/dsh-mcp-adapter",
   "version": "0.2.1",
   "description": "dsh plugin: token-efficient prompt-side shim for the official MCP client — folds mcp__* tool schemas out of every assembled prompt and exposes two constant meta-tools (mcp_list / mcp_call) instead",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "mcp",
+    "meta-tools",
+    "token-saving"
+  ],
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
