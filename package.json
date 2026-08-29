@@ -1,6 +1,6 @@
 {
   "name": "@aiwayds/dsh-mcp-adapter",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "dsh plugin: token-efficient prompt-side shim for the official MCP client — folds mcp__* tool schemas out of every assembled prompt and exposes two constant meta-tools (mcp_list / mcp_call) instead",
   "keywords": [
     "dsh",
