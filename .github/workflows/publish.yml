@@ -19,7 +19,7 @@ jobs:
           registry-url: https://registry.npmjs.org/
 
       - name: Install global dsh closure
-        run: npm install -g @deepseek-ai/dsh
+        run: npm install -g @deepseek-ai/dsh@alpha
 
       - name: Link dsh closure types
         run: node scripts/link-dsh-closure.mjs
