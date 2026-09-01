@@ -4,6 +4,8 @@ English | [简体中文](README.zh.md)
 
 Token-efficient MCP adapter for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) — a **prompt-side shim** inspired by [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter).
 
+**Requires dsh >= 0.1.2-alpha.3** — the plugin targets the 0.1.2-alpha host line only; the rc line is no longer supported.
+
 ## The problem
 
 The official `@deepseek-ai/dsh-mcp-client` plugin registers every discovered MCP tool natively (`mcp__<server>__<tool>`), so **every request pays the full JSON Schema of every MCP tool** — the upstream README states this outright: *"Data-dependent schema cost is paid on every request while the tools are registered."* With a handful of servers and dozens of tools, that is thousands of tokens burned per message, whether or not the model ever calls them.

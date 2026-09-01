@@ -56,7 +56,10 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { ContentBlock, ToolSchema } from '@deepseek-ai/dsh-llm'
-import type { ToolDefinition, ToolExecution, ToolExecutionResult, JsonValue } from '@deepseek-ai/dsh-tools'
+import type { ToolDefinition, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+// alpha.3 split package: JsonValue no longer re-exports from the dsh-tools
+// root (it lives in dsh-util-values now).
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { ScopeKey } from '@deepseek-ai/dsh-scope'
 // Side-effect type imports: declaration-merge the `tools`, `commands` and
 // `settings` services onto Context and the `system-prompt/assemble` waterfall
@@ -64,11 +67,13 @@ import type { ScopeKey } from '@deepseek-ai/dsh-scope'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-commands'
-// `settingsNamespace` is the one RUNTIME import from dsh-settings: cheap
-// kebab-case validation of our namespace string at module load.
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
-import type { SettingsNamespace, SettingsScope } from '@deepseek-ai/dsh-settings'
-import type {} from '@deepseek-ai/dsh-settings'
+// Type-only import: loads dsh-settings' declaration merging (the `settings`
+// service on Context) and the SettingsScope type. dsh-settings
+// 0.1.2-alpha.3 removed the settingsNamespace() runtime helper this file
+// used to call at module load; register() now brand-checks the plain
+// literal below at the type level (SettingsNamespaceInput) and validates
+// the same pattern at runtime via parseSettingsNamespace.
+import type { SettingsScope } from '@deepseek-ai/dsh-settings'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'mcp-adapter'
@@ -115,8 +120,13 @@ const PREFIX_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
 /** Upper bound of the stable per-server id space. */
 export const MCP_SERVER_ID_LIMIT = 99
 
-/** dsh settings namespace persisting the stable ids and the disabled set. */
-export const MCP_ADAPTER_SETTINGS_NAMESPACE: SettingsNamespace = settingsNamespace('mcp-adapter')
+/**
+ * dsh settings namespace persisting the stable ids and the disabled set.
+ * Plain literal: dsh-settings 0.1.2-alpha.3 removed the runtime
+ * settingsNamespace() helper this constant used to call (same adaptation as
+ * dsh-model-sync / dsh-cron / dsh-vault).
+ */
+export const MCP_ADAPTER_SETTINGS_NAMESPACE = 'mcp-adapter'
 
 /**
  * The persisted gate state (one settings section). `serverIds` maps every

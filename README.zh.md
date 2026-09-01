@@ -4,6 +4,8 @@
 
 面向 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) 的省 token MCP 适配器——一个受 [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) 启发的 **prompt-side shim**（提示词侧垫片）。
 
+**Requires dsh >= 0.1.2-alpha.3** —— 本插件只面向 0.1.2-alpha 宿主线，rc 线不再支持。
+
 ## 问题
 
 官方 `@deepseek-ai/dsh-mcp-client` 插件把发现的每个 MCP 工具都原生注册进工具表（`mcp__<server>__<tool>`），于是**每次请求都要为每个 MCP 工具的完整 JSON Schema 付费**——上游 README 原话：*"Data-dependent schema cost is paid on every request while the tools are registered."* 几个 server、几十个工具下来，就是每条消息烧掉数千 token，无论模型是否真的调用它们。
