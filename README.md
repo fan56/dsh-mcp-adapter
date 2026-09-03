@@ -4,7 +4,7 @@ English | [简体中文](README.zh.md)
 
 Token-efficient MCP adapter for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) — a **prompt-side shim** inspired by [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter).
 
-**Requires dsh >= 0.1.2-alpha.4** — the plugin targets the 0.1.2-alpha host line only; the rc line is no longer supported.
+**Requires dsh >= 0.1.2-rc.1** — this plugin targets the dsh RC/stable line only (CI and releases resolve the newest of the `latest`/`next` dist-tags at runtime). **The alpha line is no longer supported.**
 
 ## The problem
 

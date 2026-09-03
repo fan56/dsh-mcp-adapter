@@ -4,7 +4,7 @@
 
 面向 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) 的省 token MCP 适配器——一个受 [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) 启发的 **prompt-side shim**（提示词侧垫片）。
 
-**Requires dsh >= 0.1.2-alpha.4** —— 本插件只面向 0.1.2-alpha 宿主线，rc 线不再支持。
+**要求 dsh >= 0.1.2-rc.1** — 本插件只跟随 dsh RC/stable 线（CI 与发版在运行时解析 latest/next 中更新的 dist-tag）。**不再支持 alpha 线。**
 
 ## 问题
 

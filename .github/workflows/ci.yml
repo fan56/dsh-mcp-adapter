@@ -5,7 +5,7 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Daily 03:39 UTC — catches upstream dsh alpha drift without hand-pinning.
+    # Daily 03:39 UTC — catches upstream dsh drift without hand-pinning.
     - cron: '39 3 * * *'
 
 permissions:
@@ -33,11 +33,20 @@ jobs:
       # Typechecking imports @deepseek-ai/* from the global dsh closure via
       # scripts/link-dsh-closure.mjs. A pristine runner has none, so install
       # the public CLI first — it carries the closure the linker resolves.
-      # The rolling @alpha dist-tag, never hand-pinned and never `latest`
-      # (latest still points at the rc line this plugin dropped).
-      - name: Install global dsh (rolling @alpha dist-tag)
+      # Rolling rc/stable line (newest of latest/next at runtime), never
+      # hand-pinned and never the retired `alpha` dist-tag.
+      - name: Install dsh CLI (rolling rc/stable line — newest of latest/next, never alpha)
         run: |
-          DSH_VERSION="$(npm view @deepseek-ai/dsh@alpha version)"
+          # Policy (2026-09-03): the alpha line is retired for CI. Resolve the
+          # newest of the `latest` (stable) and `next` (rc) dist-tags at
+          # runtime, never hand-pinned — when a stable 0.1.2+ lands on
+          # `latest` it wins over the rc by plain semver compare.
+          STABLE="$(npm view @deepseek-ai/dsh@latest version)"
+          RC="$(npm view @deepseek-ai/dsh@next version 2>/dev/null || true)"
+          DSH_VERSION="$STABLE"
+          if [ -n "$RC" ] && [ "$(printf '%s\n' "$STABLE" "$RC" | sort -V | tail -1)" = "$RC" ]; then
+            DSH_VERSION="$RC"
+          fi
           echo "dsh closure: ${DSH_VERSION}"
           npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" --no-audit --no-fund
 
