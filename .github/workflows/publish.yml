@@ -47,6 +47,26 @@ jobs:
           npm version "${TAG_VERSION}" --no-git-tag-version --allow-same-version
           echo "publishing @aiwayds/dsh-mcp-adapter@${TAG_VERSION} (tag ${GITHUB_REF_NAME})"
       - name: Publish
-        run: npm publish --access public --provenance
+        # A re-pushed tag (or a publish landing mid-run) can race an
+        # already-published version. npm versions are immutable, so if the
+        # version is already on npm — visible up front via `npm view`, or
+        # matched by the registry's "cannot publish over" 403 after the
+        # first PUT succeeded — degrade to a warning instead of failing.
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if npm view "@aiwayds/dsh-mcp-adapter@${TAG_VERSION}" version >/dev/null 2>&1; then
+            echo "::warning::@aiwayds/dsh-mcp-adapter@${TAG_VERSION} is already on npm — skipping publish"
+            exit 0
+          fi
+          set +e
+          PUB_OUT="$(npm publish --access public --provenance 2>&1)"
+          PUB_RC=$?
+          set -e
+          printf '%s\n' "$PUB_OUT"
+          if [ "${PUB_RC}" -ne 0 ] && printf '%s' "$PUB_OUT" | grep -q "cannot publish over the previously published versions"; then
+            echo "::warning::@aiwayds/dsh-mcp-adapter@${TAG_VERSION} was published concurrently (or landed mid-publish) — treating as success"
+            exit 0
+          fi
+          exit "${PUB_RC}"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
