@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] - 2026-09-05
+
+### Changed
+- Clean-uninstall documentation + an uninstall leg in the boot smoke asserting removal reconciles the profile tree back to stock: a README (en/zh) Uninstall section (`dsh plugin --profile <name> remove @aiwayds/dsh-mcp-adapter` — the host splices the bundles entry and drops the patch layer; the `mcp-adapter:` section in `~/.dsh/settings.yaml` deliberately stays so stable server ids survive a reinstall, delete it to purge and let ids re-allocate)
+
 ## [0.4.0] - 2026-09-03
 
 ### Changed

@@ -46,6 +46,18 @@
 dsh plugin --profile <name> add @aiwayds/dsh-mcp-adapter
 ```
 
+## 卸载
+
+```
+dsh plugin --profile <name> remove @aiwayds/dsh-mcp-adapter
+```
+
+宿主会自动完成清理：`dsh.profile.bundles` 里对应的条目被拼接移除，插件的 patch 层随之失效。
+
+有一份状态被刻意**保留**：`~/.dsh/settings.yaml` 里的 `mcp-adapter:` 小节——stable server id（1..99）和 disabled 门闩。它按设计永不回收：重装本插件后，每个 server 仍沿用之前的 id。
+
+连这份状态也想清掉的话，请自行删除 `settings.yaml` 里的 `mcp-adapter:` 小节；重装时 id 会重新分配。
+
 ## 配置
 
 | 键 | 默认值 | 含义 |

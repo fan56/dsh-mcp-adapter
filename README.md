@@ -54,6 +54,18 @@ Or directly from git:
 dsh plugin --profile <name> add github:fan56/dsh-mcp-adapter
 ```
 
+## Uninstall
+
+```
+dsh plugin --profile <name> remove @aiwayds/dsh-mcp-adapter
+```
+
+The host reconciles the profile automatically: the `dsh.profile.bundles` entry is spliced out and the package's patch layer drops.
+
+One thing deliberately **stays**: the `mcp-adapter:` section in `~/.dsh/settings.yaml` — the stable server ids (`1..99`) and the disabled gates. It is never pruned by design: if you reinstall the plugin, every server keeps the same id it had before.
+
+To purge that state too, delete the `mcp-adapter:` section from `settings.yaml` yourself; ids will be re-allocated from scratch on reinstall.
+
 ## Config
 
 | key | default | meaning |
