@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.2] - 2026-09-11
+
+### Changed
+- README (en/zh) declares the dsh support floor as `>= 0.1.5-rc.2` (docs-only — the package declares no `@deepseek-ai/*` dependencies, so the manifest and the shipped artifact are unchanged)
+- Release policy: prerelease tags publish on side dist-tags and never move `latest`
+
 ## [0.4.1] - 2026-09-05
 
 ### Changed
