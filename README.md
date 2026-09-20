@@ -29,6 +29,8 @@ Image results keep their native behavior: `mcp_call` delegates `output.render` t
 
 **Code Mode:** under `mode: 'code'` the wire already collapses to `run_code`; this plugin is a no-op there.
 
+**Host resource tools (dsh ≥ 0.1.6):** the host ships `@deepseek-ai/dsh-mcp-resources`, which registers three shared tools — `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource` — without the `mcp__` prefix. By design they never enter the fold path and surface to the model natively; the fold/keep semantics are unchanged, and `keep` only ever promotes names that match the prefix, so nothing here is affected.
+
 **Load position:** loaded through host composition (the `cordis.patch.yml` `insert` below) the adapter is global — every agent's assemblies are folded. Loaded through an agent-scoped context instead, it applies only to that agent.
 
 ## Setup

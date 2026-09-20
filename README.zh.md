@@ -29,6 +29,8 @@
 
 **Code Mode：** 在 `mode: 'code'` 下线上本来就折叠为 `run_code`，本插件天然 no-op。
 
+**宿主资源工具（dsh ≥ 0.1.6）：** 宿主内置的 `@deepseek-ai/dsh-mcp-resources` 注册三个共享工具 —— `list_mcp_resources`、`list_mcp_resource_templates`、`read_mcp_resource`，均不带 `mcp__` 前缀。它们按设计不进折叠路径，原生呈现给模型；折叠与 keep 语义保持不变，`keep` 也只会命中匹配前缀的名字，本插件无需任何额外配置。
+
 **加载位置：** 经宿主组合加载（即下方 `cordis.patch.yml` 的 `insert` 行）时全局生效——所有 agent 的装配都会被折叠；若经某个 agent 的 scoped context 加载，则只对该 agent 生效。
 
 ## 安装
