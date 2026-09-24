@@ -19,9 +19,9 @@
 //
 // dsh-mcp-adapter note: with no MCP servers configured the meta-tools mount
 // but nothing folds (idle); the smoke proves the plugin LOADS and APPLIES —
-// including the settings-backed gate namespace registration — under the
-// real host, which is exactly the gate (a broken import/inject/compose dies
-// with a loader error).
+// including the file-backed gate store construction (a silent no-op boot read
+// when no gate file exists yet) — under the real host, which is exactly the
+// gate (a broken import/inject/compose dies with a loader error).
 
 import { spawnSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'

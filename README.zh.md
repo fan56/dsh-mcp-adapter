@@ -4,7 +4,7 @@
 
 面向 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) 的省 token MCP 适配器——一个受 [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) 启发的 **prompt-side shim**（提示词侧垫片）。
 
-**要求 dsh >= 0.1.5-rc.2** — 本插件只跟随 dsh RC/stable 线（CI 与发版在运行时解析 latest/next 中更新的 dist-tag）。**不再支持 alpha 线。**
+**要求 dsh >= 0.1.7-rc.1** — 本插件只跟随 dsh RC/stable 线（CI 与发版在运行时解析 latest/next 中更新的 dist-tag）。**不再支持 alpha 线。**
 
 ## 问题
 
@@ -56,9 +56,11 @@ dsh plugin --profile <name> remove @aiwayds/dsh-mcp-adapter
 
 宿主会自动完成清理：`dsh.profile.bundles` 里对应的条目被拼接移除，插件的 patch 层随之失效。
 
-有一份状态被刻意**保留**：`~/.dsh/settings.yaml` 里的 `mcp-adapter:` 小节——stable server id（1..99）和 disabled 门闩。它按设计永不回收：重装本插件后，每个 server 仍沿用之前的 id。
+有一份状态被刻意**保留**：插件自己的门闩文件 `~/.dsh/storages/mcp-adapter/gate.json`（设置了 `DSH_HOME` 则以其为准）——stable server id（1..99）和 disabled 门闩。它按设计永不回收：重装本插件后，每个 server 仍沿用之前的 id。
 
-连这份状态也想清掉的话，请自行删除 `settings.yaml` 里的 `mcp-adapter:` 小节；重装时 id 会重新分配。
+连这份状态也想清掉的话，请自行删除 `storages/mcp-adapter/` 目录；重装时 id 会重新分配。
+
+从 dsh 0.1.5 升级：旧 `settings.yaml` 里的 `mcp-adapter:` 小节**不会**自动迁移（0.1.7 宿主首次启动时把该文件一次性导入并改名为 `settings.yaml.imported`，而旧段名与本插件 entry id 不同名）。原文仍可在 `settings.yaml.imported` 里查看；此前 disable 过的 server 需各补一条 `/mcp disable <id>` 重新闩上。profile patch 里该 entry 的 `config:` 配置原样继承，不受影响。
 
 ## 配置
 
@@ -68,6 +70,7 @@ dsh plugin --profile <name> remove @aiwayds/dsh-mcp-adapter
 | `keep` | `[]` | 保持原生进 prompt 的名字模式（`*` 通配）——对应 pi-mcp-adapter 的 direct 模式，适合高频、值得占一等座 schema 的工具 |
 | `servers` | `[]` | server 白名单：非空时只有这些 server 的工具会被折叠 / 进目录 / 可分发（三处共用同一份名单） |
 | `descriptionLimit` | `200` | `mcp_list` 目录里每条工具描述的最大字符数 |
+| `storageDir` | `""` | 门闩存储目录覆盖；空 = `<dsh home>/storages/mcp-adapter`（插件启动时读一次，改后需重启插件生效） |
 
 ```yaml
 config:
@@ -78,6 +81,8 @@ config:
     - fs
     - github
 ```
+
+以上字段全部声明为 **volatile**（dsh 0.1.7 settings 契约）：五个键都会出现在插件设置页（entry `dsh-mcp-adapter`）中，在设置页修改**无需重启插件即可生效**——折叠边界、目录与分发在下一次使用时立即采用新值。profile patch 里的 `config:` 写法照旧可用。
 
 **信任边界：** 默认所有匹配 `prefix` 的工具都会被折叠——前缀只是命名约定而非安全边界，第三方插件恰好用 `mcp__*` 注册的工具同样会折叠。若只信任官方 client 的 server，请在 `servers` 里显式列出；其余保持原生（仍可直调，只是不走 meta-tool）。
 
@@ -101,9 +106,9 @@ config:
 | `/mcp disable <id>` | 把一个 server 整体闩上：工具强制折叠出 prompt（keep 与 `servers` 豁免一并覆盖）、从 `mcp_list` 目录消失、`mcp_call` 拒绝并给 `/mcp enable <id>` 指引 |
 | `/mcp enable <id>` | 用同一个 stable id 复原 |
 
-其余形态一律回复用法说明。`/mcp` 观测到的每个 server 都会分到一个稳定数字 id（1..99，最小空闲优先），经 dsh settings 服务持久化到配置文件的 `mcp-adapter:` 小节（默认安装即 `~/.dsh/settings.yaml`）。id 跨重启、跨 re-sync 空窗保持不变，且永不回收——一个 id 永远指同一个 server；99 个用尽时由 `/mcp` 视图明确标注（`id space exhausted (99/99): N server(s) beyond the cap cannot be gated`，受影响的分组行会带标记）。
+其余形态一律回复用法说明。`/mcp` 观测到的每个 server 都会分到一个稳定数字 id（1..99，最小空闲优先），持久化到插件自己的门闩文件 `<dsh home>/storages/mcp-adapter/gate.json`（机器态——刻意用文件而非设置页字段）。id 跨重启、跨 re-sync 空窗保持不变，且永不回收——一个 id 永远指同一个 server；99 个用尽时由 `/mcp` 视图明确标注（`id space exhausted (99/99): N server(s) beyond the cap cannot be gated`，受影响的分组行会带标记）。
 
-disable 是**门闩式开关，不是真断连**：官方 client 不提供断连 API，工具仍留在注册表里、连接照常运行——门闩只把它请出 prompt、目录与分发。三层门闩共用同一个判定函数，彼此之间以及与 `/mcp` 的展示永远不会口径不一。enable/disable 经 settings 服务持久化；没有 settings 服务时其余功能照常，只有 toggle 会回一条说明性报错。
+disable 是**门闩式开关，不是真断连**：官方 client 不提供断连 API，工具仍留在注册表里、连接照常运行——门闩只把它请出 prompt、目录与分发。三层门闩共用同一个判定函数，彼此之间以及与 `/mcp` 的展示永远不会口径不一。enable/disable 经该文件持久化（tmp+rename 原子写；文档损坏时启动告警一次并退化为全启，下一次分配写会自动修复）。若存储位置完全不可写，其余功能照常，只有 toggle 会回一条持久化报错。
 
 一条真实边界：门闩生效在 prompt 侧（目录/分发层）；记得完整工具名的模型仍可能原生直调 `mcp__server__tool` 成功——需要硬性拦截时，请配合管线 guard 或 `tools.restrict()`。
 

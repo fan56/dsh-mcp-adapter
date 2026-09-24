@@ -1,12 +1,18 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   MCP_LIST_TOOL_NAME,
   MCP_CALL_TOOL_NAME,
   MCP_COMMAND_USAGE,
   MCP_SERVER_ID_LIMIT,
-  MCP_ADAPTER_SETTINGS_NAMESPACE,
-  SERVER_ID_REGISTRY_SCHEMA,
+  MCP_ADAPTER_STORAGE_DIRNAME,
+  GATE_FILE_NAME,
+  Config,
+  createFileGateStore,
+  resolveGateDir,
   parseMcpCommandInput,
   normalizeServerGate,
   isServerDisabled,
@@ -27,6 +33,21 @@ import {
   executeMcpCommand,
   apply,
 } from '../lib/index.js'
+
+/** Fresh scratch storage dir per call — gate files must never leak across tests. */
+function freshDir() {
+  return mkdtempSync(join(tmpdir(), 'mcp-adapter-gate-'))
+}
+
+/** Runtime config via the 0.1.7 injection form, pointed at a scratch storage dir. */
+function runtimeConfig(overrides = {}) {
+  return Config({ storageDir: freshDir(), ...overrides })
+}
+
+/** The gate document path for one storage dir. */
+function gateFile(dir) {
+  return join(dir, GATE_FILE_NAME)
+}
 
 const OPTIONS = { prefix: 'mcp__', keep: [], servers: [], descriptionLimit: 200 }
 
@@ -75,8 +96,67 @@ test('normalize: two names mapping one id keep the first mapping only', () => {
   assert.equal(gate.serverIds.second, undefined)
 })
 
-test('the persisted registry schema fills defaults for a missing section', () => {
-  assert.deepEqual(SERVER_ID_REGISTRY_SCHEMA({}), { serverIds: {}, disabled: [] })
+// ---- gate store (file-backed since the 0.1.7 settings migration) ----
+
+test('gate store: a missing file is the silent empty zero state; defaults fill in', () => {
+  const warnings = []
+  const store = createFileGateStore(freshDir(), message => warnings.push(message))
+  assert.deepEqual(store.get(), { serverIds: {}, disabled: [] })
+  assert.equal(warnings.length, 0, 'fresh installs boot quiet')
+})
+
+test('gate store: writes land atomically in gate.json and reload into a fresh store', async () => {
+  const dir = freshDir()
+  const warnings = []
+  const store = createFileGateStore(dir, message => warnings.push(message))
+  await store.write({ serverIds: { fs: 1, gh: 2 }, disabled: [2] })
+  assert.deepEqual(store.get(), { serverIds: { fs: 1, gh: 2 }, disabled: [2] })
+  // The document is complete, self-contained JSON — exactly what the old
+  // wholesale settings replace guaranteed.
+  assert.deepEqual(JSON.parse(readFileSync(gateFile(dir), 'utf8')), { serverIds: { fs: 1, gh: 2 }, disabled: [2] })
+  // A store over the same directory observes the persisted state.
+  const reloaded = createFileGateStore(dir, message => warnings.push(message))
+  assert.deepEqual(reloaded.get(), { serverIds: { fs: 1, gh: 2 }, disabled: [2] })
+  assert.equal(warnings.length, 0)
+})
+
+test('gate store: a corrupt document warns once and degrades to the empty gate', () => {
+  const dir = freshDir()
+  writeFileSync(gateFile(dir), '{ this is not json', 'utf8')
+  const warnings = []
+  const store = createFileGateStore(dir, message => warnings.push(message))
+  assert.deepEqual(store.get(), { serverIds: {}, disabled: [] }, 'every server counts as enabled')
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /unreadable/)
+  assert.match(warnings[0], /empty gate/)
+  // Sanitization still applies to parseable-but-junk documents (no warning needed).
+  const junkDir = freshDir()
+  writeFileSync(gateFile(junkDir), JSON.stringify({ serverIds: { fs: 999 }, disabled: [501] }), 'utf8')
+  const junkStore = createFileGateStore(junkDir, () => {})
+  assert.deepEqual(junkStore.get(), { serverIds: {}, disabled: [] })
+})
+
+test('gate store: a failed write keeps the mirror unchanged (state unchanged contract)', async () => {
+  const dir = freshDir()
+  const store = createFileGateStore(dir, () => {})
+  await store.write({ serverIds: { fs: 1 }, disabled: [] })
+  // Point a second store at a path that cannot be created: a regular FILE
+  // where the directory should be.
+  const blocked = join(freshDir(), 'not-a-dir')
+  writeFileSync(blocked, 'x', 'utf8')
+  const failing = createFileGateStore(blocked, () => {})
+  await assert.rejects(
+    () => failing.write({ serverIds: { gh: 2 }, disabled: [] }),
+    'the write error surfaces to the command layer',
+  )
+  assert.deepEqual(failing.get(), { serverIds: {}, disabled: [] }, 'the mirror never advances past a failed write')
+  assert.deepEqual(store.get(), { serverIds: { fs: 1 }, disabled: [] }, 'other stores are unaffected')
+})
+
+test('resolveGateDir: empty resolves under the dsh home; overrides resolve verbatim', () => {
+  const dir = resolveGateDir('')
+  assert.ok(dir.endsWith(join('storages', MCP_ADAPTER_STORAGE_DIRNAME)), `default lands under <home>/storages/${MCP_ADAPTER_STORAGE_DIRNAME}: ${dir}`)
+  assert.equal(resolveGateDir('/tmp/custom-gate'), '/tmp/custom-gate')
 })
 
 test('isServerDisabled: positive evidence required; unmapped/absent/empty-server mean enabled', () => {
@@ -273,6 +353,34 @@ test('factories: mcp_list/mcp_call observe the LIVE callback value on every exec
   assert.match(closedCatalog.error, /\/mcp enable 2/)
   const refused = await call.execute({ tool: 'mcp__gh__x' }, {})
   assert.match(refused.error, /\/mcp enable 2/)
+})
+
+test('volatile wiring: factory thunks and live option objects re-read config per execution', async () => {
+  let prefix = 'mcp__'
+  let servers = ['a']
+  const schemas = [schema('mcp__a__x'), schema('mcp__b__y')]
+  const list = createMcpListTool({
+    get prefix() { return prefix },
+    get servers() { return servers },
+    get descriptionLimit() { return 200 },
+  }, () => schemas)
+  const call = createMcpCallTool(() => prefix, () => ({ async execute() { return { ok: true } } }), () => servers)
+  // Baseline: only whitelisted server a is cataloged; b's tool refuses dispatch.
+  const open = await list.execute({}, {})
+  assert.deepEqual(open.servers.map(group => group.server), ['a'])
+  const refused = await call.execute({ tool: 'mcp__b__y' }, {})
+  assert.match(refused.error, /servers list/)
+  // A settings-page swap (no remount — volatile contract) reaches the very
+  // next execution through the same definitions.
+  servers = ['a', 'b']
+  const widened = await list.execute({}, {})
+  assert.deepEqual(widened.servers.map(group => group.server), ['a', 'b'])
+  const dispatched = await call.execute({ tool: 'mcp__b__y' }, {})
+  assert.deepEqual(dispatched, { ok: true })
+  // The dispatch boundary prefix is live too.
+  prefix = 'mx__'
+  const foreign = await call.execute({ tool: 'mcp__b__y' }, {})
+  assert.match(foreign.error, /prefix/)
 })
 
 // ---- /mcp command surface ----
@@ -479,7 +587,7 @@ test('command flow: unknown or not-live ids answer error + usage; exhaustion nam
   assert.match(exhaustedConfig.text, /id space exhausted \(99\/99\): 3 server\(s\) beyond the cap cannot be gated/)
 })
 
-test('command flow: absent settings service and failed persistence surface as errors', async () => {
+test('command flow: absent gate store and failed persistence surface as errors', async () => {
   const missing = await executeMcpCommand({
     rawInput: 'disable 1',
     schemas: schemasFor(),
@@ -489,7 +597,7 @@ test('command flow: absent settings service and failed persistence surface as er
     writeGate: undefined,
   })
   assert.equal(missing.kind, 'error')
-  assert.match(missing.text, /settings service/)
+  assert.match(missing.text, /gate store/)
 
   const boom = new Error('disk on fire')
   const failing = await executeMcpCommand({
@@ -544,39 +652,18 @@ test('command flow: an aborted toggle stops waiting and reports the unconfirmed 
   assert.match(preAborted.text, /persist interrupted before confirming/)
 })
 
-// ---- apply() wiring with a mocked settings registration ----
+// ---- apply() wiring over the file-backed gate store ----
 
 /**
- * Settings seam stub: register(ns, schema) layers defaults like production;
- * replace records each section so tests can watch the exact write payload.
- * A "broken read" simulates a provider whose resolved-value lookup throws —
- * the B1 fail-open contract is that consumers see an absent gate instead.
+ * Standalone ctx stub: gate persistence rides runtimeConfig()'s scratch
+ * storageDir (no host service involved since the file-store migration); the
+ * `commands` service mounts softly exactly like production. The gate store's
+ * warning seam is captured so boot-time degradation is observable.
  */
-function settingsHost(store, brokenRead = false) {
-  return {
-    register(ns, schemaFn) {
-      const entry = store.sections[ns] ?? (store.sections[ns] = { resolved: schemaFn({}), user: undefined })
-      if (entry.resolved === undefined) entry.resolved = schemaFn({})
-      return {
-        get: () => {
-          if (brokenRead) throw new Error('settings backend exploded')
-          return entry.resolved
-        },
-        replace: async (section) => {
-          entry.user = section
-          entry.resolved = schemaFn(section)
-          store.writes.push(structuredClone(section))
-        },
-      }
-    },
-  }
-}
-
-function stubCtx({ mountSettings = true, brokenGateReads = false, mountCommands = true } = {}) {
-  const store = { sections: {}, writes: [] }
+function stubCtx({ mountCommands = true } = {}) {
   const state = {
     registered: new Map(), commands: new Map(), effects: [], warnings: [],
-    listeners: [], injections: [], store,
+    listeners: [], injections: [],
   }
   const ctx = {
     tools: {
@@ -597,15 +684,13 @@ function stubCtx({ mountSettings = true, brokenGateReads = false, mountCommands 
     },
     inject(services, callback) {
       state.injections.push([...services])
-      let disposer
-      if (mountSettings && services.includes('settings')) disposer = callback({ settings: settingsHost(store, brokenGateReads) })
       if (mountCommands && services.includes('commands')) {
         // The soft mount's callback returns the teardown disposer; surface it
         // as a labeled effect so tests can exercise teardown exactly.
         const commandDisposer = callback({ commands: ctx.commands, logger: ctx.logger })
         if (commandDisposer !== undefined) state.effects.push({ disposer: commandDisposer, label: 'mcp-adapter.command' })
       }
-      return () => { if (disposer !== undefined) disposer() }
+      return () => {}
     },
     on(event, listener) { state.listeners.push({ event, listener }); return () => {} },
     effect(execute, label) { const disposer = execute(); state.effects.push({ disposer, label }); return disposer },
@@ -614,16 +699,13 @@ function stubCtx({ mountSettings = true, brokenGateReads = false, mountCommands 
   return { ctx, state }
 }
 
-const BASE_CONFIG = { prefix: 'mcp__', keep: [], servers: [], descriptionLimit: 200 }
-
-test('apply(): settings namespace registered under "mcp-adapter"; ids assigned and persisted on first /mcp', async () => {
+test('apply(): gate loads from the storage dir; ids assigned and persisted on first /mcp', async () => {
   const { ctx, state } = stubCtx()
-  apply(ctx, BASE_CONFIG)
-  assert.deepEqual(state.injections[0], ['settings'])
-  assert.deepEqual(state.injections[1], ['commands'],
-    'the commands service rides a runtime soft-mount, not the static inject')
-  const namespaceEntry = state.store.sections[MCP_ADAPTER_SETTINGS_NAMESPACE]
-  assert.deepEqual(namespaceEntry.resolved, { serverIds: {}, disabled: [] })
+  const dir = freshDir()
+  apply(ctx, Config({ storageDir: dir }))
+  // The only host service the plugin still soft-mounts is `commands` — gate
+  // persistence needs none since the file-store migration.
+  assert.deepEqual(state.injections, [['commands']])
 
   state.registered.set('mcp__fs__read_file', schema('mcp__fs__read_file', 'Read files'))
   state.registered.set('mcp__fs__write_file', schema('mcp__fs__write_file', 'Write files'))
@@ -631,13 +713,17 @@ test('apply(): settings namespace registered under "mcp-adapter"; ids assigned a
   const outcome = await handler(invocationLike(''))
   assert.equal(outcome.kind, 'success')
   assert.match(outcome.text, /^\[1\] fs \(2\)$/m)
-  assert.equal(state.store.writes.length, 1)
-  assert.deepEqual(state.store.writes[0], { serverIds: { fs: 1 }, disabled: [] })
+  assert.deepEqual(
+    JSON.parse(readFileSync(gateFile(dir), 'utf8')),
+    { serverIds: { fs: 1 }, disabled: [] },
+    'the first sighting persisted its allocation to gate.json',
+  )
 })
 
-test('apply(): /mcp disable drives all three latches end-to-end through one settings document', async () => {
+test('apply(): /mcp disable drives all three latches end-to-end through one gate.json document', async () => {
   const { ctx, state } = stubCtx()
-  apply(ctx, BASE_CONFIG)
+  const dir = freshDir()
+  apply(ctx, Config({ storageDir: dir }))
   state.registered.set('mcp__fs__read_file', liveTool('mcp__fs__read_file', 'Read files'))
   state.registered.set('mcp__gh__create_issue', liveTool('mcp__gh__create_issue', 'Issues'))
   const handler = state.commands.get('mcp').handler
@@ -647,9 +733,8 @@ test('apply(): /mcp disable drives all three latches end-to-end through one sett
   assert.equal(off.kind, 'success')
   assert.match(off.text, /server "fs" \(id 1\) disabled/)
   assert.match(off.text, /\/mcp enable 1/)
-  const section = state.store.sections[MCP_ADAPTER_SETTINGS_NAMESPACE]
-  assert.deepEqual(section.user.disabled, [1])
-  assert.deepEqual(section.resolved.disabled, [1])
+  const section = () => JSON.parse(readFileSync(gateFile(dir), 'utf8'))
+  assert.deepEqual(section().disabled, [1])
 
   // Latch 1: the waterfall now force-folds fs even though nothing else would.
   const listener = state.listeners.find(entry => entry.event === 'system-prompt/assemble').listener
@@ -676,23 +761,24 @@ test('apply(): /mcp disable drives all three latches end-to-end through one sett
   assert.doesNotMatch(tree.text, /mcp__fs__read_file — Read files/)
   assert.match(tree.text, /folding ACTIVE — folded 2, kept 0/)
 
-  // Enable flips everything back through the same persistent doc.
+  // Enable flips everything back through the same persistent document.
   const onOutcome = await handler(invocationLike('enable 1'))
   assert.equal(onOutcome.kind, 'success')
   const restored = await state.registered.get(MCP_CALL_TOOL_NAME).execute({ tool: 'mcp__fs__read_file' }, { agent: undefined })
   assert.deepEqual(restored, { ok: true, args: {} }, 'dispatch reaches the child again after enable')
-  assert.deepEqual(state.store.sections[MCP_ADAPTER_SETTINGS_NAMESPACE].user.disabled, [])
+  assert.deepEqual(section().disabled, [])
   // Same stable id survives the whole cycle.
   const finalTree = await handler(invocationLike(''))
   assert.match(finalTree.text, /^\[1\] fs \(1\)$/m)
 })
 
-test('apply(): hand-edited gate sections degrade instead of wedging the latches', async () => {
+test('apply(): hand-edited gate documents degrade instead of wedging the latches', async () => {
   const { ctx, state } = stubCtx()
-  apply(ctx, BASE_CONFIG)
-  // Simulate a corrupt stored section resolved by the provider: an
-  // out-of-range id and a disabled flag mapping to nothing.
-  state.store.sections[MCP_ADAPTER_SETTINGS_NAMESPACE].resolved = { serverIds: { fs: 999 }, disabled: [1] }
+  const dir = freshDir()
+  // A hand-edited document on disk: an out-of-range id and a disabled flag
+  // mapping to nothing.
+  writeFileSync(gateFile(dir), JSON.stringify({ serverIds: { fs: 999 }, disabled: [1] }), 'utf8')
+  apply(ctx, Config({ storageDir: dir }))
   state.registered.set('mcp__fs__read_file', schema('mcp__fs__read_file'))
   const handler = state.commands.get('mcp').handler
   // id 999 sanitizes away; the burned orphan id 1 is skipped, so fs lands on 2.
@@ -702,62 +788,79 @@ test('apply(): hand-edited gate sections degrade instead of wedging the latches'
   assert.doesNotMatch(outcome.text, /⏸/)
 })
 
-test('apply(): without a settings service the command explains it and folding continues', async () => {
-  const { ctx, state } = stubCtx({ mountSettings: false })
-  apply(ctx, BASE_CONFIG)
-  state.registered.set('mcp__fs__read_file', schema('mcp__fs__read_file'))
+test('apply(): an unwritable gate store fails toggles loudly but folding and views continue', async () => {
+  const { ctx, state } = stubCtx()
+  // A regular FILE where the storage directory should be: the boot read sees
+  // an unreadable path and every write fails.
+  const blocked = join(freshDir(), 'not-a-dir')
+  writeFileSync(blocked, 'x', 'utf8')
+  apply(ctx, Config({ storageDir: blocked }))
+  state.registered.set('mcp__fs__read_file', liveTool('mcp__fs__read_file', 'Read files'))
   const handler = state.commands.get('mcp').handler
 
-  // Reads still work, ids simply never appear (legacy header shape).
+  // The boot-time problem is warned about exactly once, in storage terms.
+  assert.equal(state.warnings.length, 1)
+  assert.match(state.warnings[0], /unreadable/)
+
+  // Status queries still render around the broken persistence (the local
+  // allocation stays usable; ids merely re-allocate identically next time).
   const overview = await handler(invocationLike(''))
   assert.equal(overview.kind, 'success')
-  assert.match(overview.text, /^fs \(1\)$/m)
+  assert.match(overview.text, /^\[1\] fs \(1\)$/m)
 
-  // Toggles refuse loudly.
+  // The toggle itself refuses: the persist cannot be confirmed.
   const denied = await handler(invocationLike('disable 1'))
   assert.equal(denied.kind, 'error')
-  assert.match(denied.text, /settings service/)
+  assert.match(denied.text, /could not be persisted/)
+  assert.match(denied.text, /state unchanged/)
 
-  // Folding + dispatch continue ungated (everything enabled).
+  // Folding + dispatch continue ungated (everything enabled — fail-open).
   const catalog = await state.registered.get(MCP_LIST_TOOL_NAME).execute({}, { agent: undefined })
   assert.deepEqual(catalog.servers.map(group => group.server), ['fs'])
   const assembly = { sections: [], contexts: [], variables: {}, tools: [schema('read'), schema('mcp__fs__read_file')] }
   const listener = state.listeners.find(entry => entry.event === 'system-prompt/assemble').listener
   const folded = await listener(assembly, { scope: undefined }, () => Promise.resolve(assembly))
-  assert.deepEqual(folded.tools.map(tool => tool.name), ['read'],
-    'no gate snapshot keeps the fold semantics identical to v0.1')
+  assert.deepEqual(folded.tools.map(tool => tool.name), ['read'])
 })
 
-test('apply(): a throwing gate read degrades to enabled-everything and warns once (B1)', async () => {
-  const { ctx, state } = stubCtx({ brokenGateReads: true })
-  apply(ctx, BASE_CONFIG)
+test('apply(): a corrupt gate document degrades to enabled-everything, warns once, then heals (B1)', async () => {
+  const { ctx, state } = stubCtx()
+  const dir = freshDir()
+  writeFileSync(gateFile(dir), 'not json at all', 'utf8')
+  apply(ctx, Config({ storageDir: dir }))
   state.registered.set('mcp__fs__read_file', liveTool('mcp__fs__read_file'))
   const handler = state.commands.get('mcp').handler
 
-  // The command survives the throwing read; ids simply never render.
+  // The command survives; ids simply start over from the empty gate.
   const tree = await handler(invocationLike(''))
-  assert.equal(tree.kind, 'success', 'the handler must not surface the settings error')
-  assert.match(tree.text, /^fs \(1\)$/m, 'absent gate degrades the header to the legacy shape')
+  assert.equal(tree.kind, 'success', 'the handler must not surface the boot-time corruption')
+  assert.match(tree.text, /^\[1\] fs \(1\)$/m)
+  // The first allocation write heals the document for the next boot.
+  assert.deepEqual(
+    JSON.parse(readFileSync(gateFile(dir), 'utf8')),
+    { serverIds: { fs: 1 }, disabled: [] },
+  )
 
-  // The waterfall survives too: no exception escapes assemble; folding runs
-  // ungated (identical semantics to "nothing disabled").
+  // The waterfall survives too: folding runs ungated (identical semantics to
+  // "nothing disabled").
   const assembly = { sections: [], contexts: [], variables: {}, tools: [schema('read'), schema('mcp__fs__read_file')] }
   const listener = state.listeners.find(entry => entry.event === 'system-prompt/assemble').listener
   const folded = await listener(assembly, { scope: undefined }, () => Promise.resolve(assembly))
   assert.deepEqual(folded.tools.map(tool => tool.name), ['read'])
 
-  // Both meta-tools read through the same defended callback — open latches.
+  // Both meta-tools read through the same defended mirror — open latches.
   const catalog = await state.registered.get(MCP_LIST_TOOL_NAME).execute({}, { agent: undefined })
   assert.deepEqual(catalog.servers.map(group => group.server), ['fs'])
   const dispatched = await state.registered.get(MCP_CALL_TOOL_NAME).execute(
     { tool: 'mcp__fs__read_file' }, { agent: undefined },
   )
-  assert.deepEqual(dispatched, { ok: true, args: {} }, 'dispatch went through with the gate absent')
+  assert.deepEqual(dispatched, { ok: true, args: {} }, 'dispatch went through with the gate empty')
 
-  // Exactly ONE warning across every read path, and repeat invocations stay quiet.
+  // Exactly ONE warning — the boot-time corruption notice; reads come from
+  // the in-memory mirror, so repeat consumers stay quiet.
   assert.equal(state.warnings.length, 1)
-  assert.match(state.warnings[0], /reading the persisted enable\/disable state failed/)
-  assert.match(state.warnings[0], /treating every server as enabled/)
+  assert.match(state.warnings[0], /unreadable/)
+  assert.match(state.warnings[0], /empty gate/)
   await handler(invocationLike('config'))
   await listener(assembly, { scope: undefined }, () => Promise.resolve(assembly))
   assert.equal(state.warnings.length, 1, 'warn-once dedupe holds across consumers')

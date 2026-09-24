@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   MCP_LIST_TOOL_NAME,
   MCP_CALL_TOOL_NAME,
+  Config,
   matchesKeep,
   shouldFold,
   foldPromptAssembly,
@@ -17,6 +21,18 @@ import {
   createMcpCallTool,
   apply,
 } from '../lib/index.js'
+
+/** Scratch storage dir so apply()'s gate store never touches a real dsh home. */
+const TMP = mkdtempSync(join(tmpdir(), 'mcp-adapter-test-'))
+
+/**
+ * Runtime config as apply() consumes it since 0.1.7: volatile refs resolved
+ * straight from the plugin's Config schema (the template's test-injection
+ * form — `Config({...})` returns the live-reference object).
+ */
+function runtimeConfig(overrides = {}) {
+  return Config({ storageDir: TMP, ...overrides })
+}
 
 const FOLD = { prefix: 'mcp__', keep: [] }
 
@@ -552,8 +568,6 @@ test('mcp_call: output.render delegates to the child render; error wraps and mis
 
 // ---- apply() smoke (hand-written ctx stub, no mock framework) ----
 
-const BASE_CONFIG = { prefix: 'mcp__', keep: [], servers: [], descriptionLimit: 200 }
-
 function fakeCtx({ failOn } = {}) {
   const state = {
     registered: new Map(), listeners: [], effects: [], warnings: [],
@@ -580,8 +594,9 @@ function fakeCtx({ failOn } = {}) {
         return () => state.commands.delete(definition.name)
       },
     },
-    // No settings service composed here: apply's optional gating wiring
-    // degrades to "everything enabled" and records the request.
+    // Gate persistence needs no host service since the file-store migration:
+    // the store lives at runtimeConfig()'s scratch storageDir and the boot
+    // read degrades silently when no gate file exists yet.
     inject(services, callback) {
       state.injections.push([...services])
       return () => {}
@@ -604,7 +619,7 @@ function fakeCtx({ failOn } = {}) {
 
 test('apply(): registers both meta-tools and folds assemblies through the installed listener', async () => {
   const { ctx, state } = fakeCtx()
-  apply(ctx, BASE_CONFIG)
+  apply(ctx, runtimeConfig())
   assert.deepEqual([...state.registered.keys()].sort(), [MCP_CALL_TOOL_NAME, MCP_LIST_TOOL_NAME])
   const entries = state.listeners.filter(entry => entry.event === 'system-prompt/assemble')
   assert.equal(entries.length, 1)
@@ -627,7 +642,7 @@ test('apply(): registers both meta-tools and folds assemblies through the instal
 
 test('apply(): meta-tool registration failure rolls back, warns, and installs no listener', () => {
   const { ctx, state } = fakeCtx({ failOn: MCP_CALL_TOOL_NAME })
-  apply(ctx, BASE_CONFIG)
+  apply(ctx, runtimeConfig())
   // The successfully registered mcp_list was rolled back; nothing remains.
   assert.equal(state.registered.size, 0)
   assert.equal(state.listeners.length, 0)

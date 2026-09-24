@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-mcp-adapter",
+    "description": "Token-efficient MCP shim: folds mcp__* tool schemas out of every assembled prompt, exposing constant meta-tools mcp_list / mcp_call instead."
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-mcp-adapter",
+    "description": "省 token 的 MCP 垫片：把 mcp__* 工具 schema 折出每次组装的提示词，代之以恒定的 mcp_list / mcp_call 元工具。"
+  }
+}

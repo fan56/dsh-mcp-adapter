@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   MCP_LIST_TOOL_NAME,
   MCP_CALL_TOOL_NAME,
   MCP_COMMAND_NAME,
   MCP_COMMAND_USAGE,
   MCP_OUTPUT_LINE_LIMIT,
+  Config,
   parseMcpCommandInput,
   collectMcpHealth,
   renderMcpHealthLine,
@@ -19,6 +23,14 @@ import {
   apply,
   inject as declaredInject,
 } from '../lib/index.js'
+
+/** Scratch storage dir so apply()'s gate store never touches a real dsh home. */
+const TMP = mkdtempSync(join(tmpdir(), 'mcp-adapter-command-test-'))
+
+/** Runtime config via the 0.1.7 injection form: schema resolution → live volatile refs. */
+function runtimeConfig(overrides = {}) {
+  return Config({ storageDir: TMP, ...overrides })
+}
 
 const OPTIONS = { prefix: 'mcp__', keep: [], servers: [], descriptionLimit: 200 }
 
@@ -329,37 +341,15 @@ test('execute: a fail-open view renders successfully with the INACTIVE notice', 
 // ---- apply() command wiring ----
 
 /**
- * Minimal in-memory settings provider honoring the seam our apply() uses:
- * register(ns, schema) → scope { get, replace }. The REAL registry schema is
- * passed through, so resolved values layer defaults exactly like production.
+ * Standalone ctx stub mirroring mcp-adapter.test.mjs's fakeCtx, with the
+ * `commands` service wired and scope recording plus a live-mask hook so the
+ * fail-open branch of the command handler can be exercised. Gate persistence
+ * needs no host service since the file-store migration: the store lives at
+ * runtimeConfig()'s scratch storageDir. `mountCommands: false` simulates a
+ * host that never composes the platform commands service.
  */
-function settingsStub(store) {
-  return {
-    register(ns, schema) {
-      const entry = store.sections[ns] ?? (store.sections[ns] = {})
-      if (entry.resolved === undefined) entry.resolved = schema({})
-      return {
-        get: () => entry.resolved,
-        replace: async (section) => {
-          entry.resolved = schema(section)
-          store.sections[ns].user = section
-          store.writes.push({ ns, section })
-        },
-      }
-    },
-  }
-}
-
-/**
- * Standalone ctx stub mirroring mcp-adapter.test.mjs's fakeCtx plus the
- * `commands` service and an optional mounted `settings` service, with scope
- * recording and a live-mask hook so the fail-open branch of the command
- * handler can be exercised. `mountCommands: false` simulates a host that
- * never composes the platform commands service.
- */
-function stubCtx({ mountSettings = true, mountCommands = true } = {}) {
-  const store = { sections: {}, writes: [] }
-  const state = { registered: new Map(), commands: new Map(), effects: [], warnings: [], schemaScopes: [], maskedMeta: false, injections: [], store }
+function stubCtx({ mountCommands = true } = {}) {
+  const state = { registered: new Map(), commands: new Map(), effects: [], warnings: [], schemaScopes: [], maskedMeta: false, injections: [] }
   const ctx = {
     tools: {
       register(definition) {
@@ -387,15 +377,11 @@ function stubCtx({ mountSettings = true, mountCommands = true } = {}) {
     },
     inject(services, callback) {
       state.injections.push([...services])
-      let disposer
-      if (mountSettings && services.includes('settings')) {
-        disposer = callback({ settings: settingsStub(store) })
-      }
       if (mountCommands && services.includes('commands')) {
         const commandDisposer = callback({ commands: ctx.commands, logger: ctx.logger })
         if (commandDisposer !== undefined) state.effects.push({ disposer: commandDisposer, label: 'mcp-adapter.command' })
       }
-      return () => { if (disposer !== undefined) disposer() }
+      return () => {}
     },
     on(event, listener) {
       state.listeners = state.listeners ?? []
@@ -409,12 +395,12 @@ function stubCtx({ mountSettings = true, mountCommands = true } = {}) {
     },
     logger: { warn(message) { state.warnings.push(message) } },
   }
-  return { ctx, state, store }
+  return { ctx, state }
 }
 
 test('apply(): registers the /mcp command with the declared contract', () => {
   const { ctx, state } = stubCtx()
-  apply(ctx, { ...OPTIONS })
+  apply(ctx, runtimeConfig())
   const definition = state.commands.get('mcp')
   assert.notEqual(definition, undefined)
   assert.equal(definition.name, 'mcp')
@@ -424,7 +410,7 @@ test('apply(): registers the /mcp command with the declared contract', () => {
 
 test('apply(): the handler answers from the invoking agent\'s scope, live-aware', async () => {
   const { ctx, state } = stubCtx()
-  apply(ctx, { ...OPTIONS })
+  apply(ctx, runtimeConfig())
   state.registered.set('mcp__fs__read_file', schema('mcp__fs__read_file', 'Read files'))
   const definition = state.commands.get(MCP_COMMAND_NAME)
   const agent = { id: 'agent-7' }
@@ -445,7 +431,7 @@ test('apply(): the handler answers from the invoking agent\'s scope, live-aware'
 test('apply(): a /mcp name collision degrades gracefully without touching the meta-tools', () => {
   const { ctx, state } = stubCtx()
   state.commands.set(MCP_COMMAND_NAME, {})
-  apply(ctx, { ...OPTIONS })
+  apply(ctx, runtimeConfig())
   assert.equal(state.warnings.length, 1)
   assert.match(state.warnings[0], /"\/mcp" command registration failed/)
   assert.match(state.warnings[0], /name conflict on \/mcp/)
@@ -456,7 +442,7 @@ test('apply(): a /mcp name collision degrades gracefully without touching the me
 
 test('apply(): command teardown disposes exactly the command registration', () => {
   const { ctx, state } = stubCtx()
-  apply(ctx, { ...OPTIONS })
+  apply(ctx, runtimeConfig())
   const commandEffect = state.effects.find(effect => effect.label === 'mcp-adapter.command')
   assert.notEqual(commandEffect, undefined)
   assert.equal(state.commands.has(MCP_COMMAND_NAME), true)
@@ -470,7 +456,7 @@ test('apply(): the commands service stays a SOFT dependency (static inject is to
   // On such a host the plugin still loads: one warning, no command, and the
   // meta-tools + assembly listener untouched.
   const { ctx, state } = stubCtx({ mountCommands: false })
-  apply(ctx, { ...OPTIONS })
+  apply(ctx, runtimeConfig())
   state.registered.set('mcp__fs__read_file', schema('mcp__fs__read_file', 'Read files'))
   assert.equal(state.commands.has(MCP_COMMAND_NAME), false)
 

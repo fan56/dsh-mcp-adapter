@@ -4,7 +4,7 @@ English | [简体中文](README.zh.md)
 
 Token-efficient MCP adapter for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) — a **prompt-side shim** inspired by [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter).
 
-**Requires dsh >= 0.1.5-rc.2** — this plugin targets the dsh RC/stable line only (CI and releases resolve the newest of the `latest`/`next` dist-tags at runtime). **The alpha line is no longer supported.**
+**Requires dsh >= 0.1.7-rc.1** — this plugin targets the dsh RC/stable line only (CI and releases resolve the newest of the `latest`/`next` dist-tags at runtime). **The alpha line is no longer supported.**
 
 ## The problem
 
@@ -64,9 +64,11 @@ dsh plugin --profile <name> remove @aiwayds/dsh-mcp-adapter
 
 The host reconciles the profile automatically: the `dsh.profile.bundles` entry is spliced out and the package's patch layer drops.
 
-One thing deliberately **stays**: the `mcp-adapter:` section in `~/.dsh/settings.yaml` — the stable server ids (`1..99`) and the disabled gates. It is never pruned by design: if you reinstall the plugin, every server keeps the same id it had before.
+One thing deliberately **stays**: the plugin's gate file at `~/.dsh/storages/mcp-adapter/gate.json` (`$DSH_HOME` honors an override) — the stable server ids (`1..99`) and the disabled gates. It is never pruned by design: if you reinstall the plugin, every server keeps the same id it had before.
 
-To purge that state too, delete the `mcp-adapter:` section from `settings.yaml` yourself; ids will be re-allocated from scratch on reinstall.
+To purge that state too, delete the `storages/mcp-adapter/` directory yourself; ids will be re-allocated from scratch on reinstall.
+
+Upgrading from a dsh 0.1.5 install: the old `mcp-adapter:` section of `settings.yaml` is **not** auto-imported (the 0.1.7 host renames that file to `settings.yaml.imported` after its one-shot import, and the section name does not match this plugin's entry id). The original values stay readable in `settings.yaml.imported`; servers you had disabled need one `/mcp disable <id>` each to re-latch. Your `config:` values in the profile patch carry over unchanged.
 
 ## Config
 
@@ -76,6 +78,9 @@ To purge that state too, delete the `mcp-adapter:` section from `settings.yaml` 
 | `keep` | `[]` | name patterns (`*` wildcard) kept native — pi-mcp-adapter's "direct mode", for high-frequency tools that deserve first-class schemas |
 | `servers` | `[]` | server-name whitelist: when non-empty, only these servers' tools are folded / cataloged / dispatchable (all three consult the same list) |
 | `descriptionLimit` | `200` | max chars per tool description in the `mcp_list` catalog |
+| `storageDir` | `""` | gate storage directory override; empty = `<dsh home>/storages/mcp-adapter` (read once at plugin start — moving it takes effect on restart) |
+
+Every field is declared **volatile** (the dsh 0.1.7 settings contract): all five appear on the plugin's settings page under the `dsh-mcp-adapter` entry, and editing them there applies **without restarting the plugin** — the fold boundary, catalog and dispatch pick the new values up on their very next use. The `config:` block in your profile patch keeps working exactly as before.
 
 ```yaml
 config:
@@ -109,9 +114,9 @@ The plugin registers one slash command on the platform `commands` service — co
 | `/mcp disable <id>` | Latch a whole server off: its tools force-fold out of every prompt — keep and `servers` exemptions included — it disappears from the `mcp_list` catalog, and `mcp_call` refuses it with an `/mcp enable <id>` hint |
 | `/mcp enable <id>` | Restore it under the same stable id |
 
-Any other form answers with usage. Every server observed by `/mcp` gets a stable numeric id (`1..99`, smallest free first), persisted in the dsh settings service under the `mcp-adapter:` section of your settings file (`~/.dsh/settings.yaml` on a stock install). Ids survive restarts and re-sync gaps and are never recycled — an id always names the same server; when all 99 are taken the `/mcp` views label it explicitly (`id space exhausted (99/99): N server(s) beyond the cap cannot be gated`, plus a marker on each affected group).
+Any other form answers with usage. Every server observed by `/mcp` gets a stable numeric id (`1..99`, smallest free first), persisted in the plugin's own gate file at `<dsh home>/storages/mcp-adapter/gate.json` (machine state — deliberately a file, not a settings-page field). Ids survive restarts and re-sync gaps and are never recycled — an id always names the same server; when all 99 are taken the `/mcp` views label it explicitly (`id space exhausted (99/99): N server(s) beyond the cap cannot be gated`, plus a marker on each affected group).
 
-Disable is **gate-style, not a disconnect**: the official client exposes no disconnect API, so tools stay registered and connections keep running — gating only removes them from the prompt, the catalog, and dispatch. All three latches judge through one shared verdict, so they can never disagree with each other or with what `/mcp` displays. Enable/disable persist through the settings service; without one everything still works and only the toggles answer with an explanatory error.
+Disable is **gate-style, not a disconnect**: the official client exposes no disconnect API, so tools stay registered and connections keep running — gating only removes them from the prompt, the catalog, and dispatch. All three latches judge through one shared verdict, so they can never disagree with each other or with what `/mcp` displays. Enable/disable persist through that file (atomic tmp+rename writes; a corrupt document warns once at startup and degrades to everything-enabled, and the next allocation write heals it). If the storage location cannot be written at all, everything still works and only the toggles answer with a persistence error.
 
 One real boundary: that latch is prompt-side (catalog/dispatch); native direct calls to a remembered `mcp__server__tool` name may still execute — for hard enforcement pair with pipeline guards or `tools.restrict()`.
 

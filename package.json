@@ -13,6 +13,7 @@
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
+  "icon": "./icon.svg",
   "license": "MIT",
   "engines": {
     "node": ">=22.19.0"
@@ -22,10 +23,13 @@
     "scripts",
     "cordis.patch.yml",
     "README.md",
-    "README.zh.md"
+    "README.zh.md",
+    "icon.svg",
+    "locale/*.json"
   ],
   "scripts": {
     "link-closure": "node scripts/link-dsh-closure.mjs",
+    "postinstall": "node scripts/link-dsh-closure.mjs",
     "build": "tsc -p tsconfig.json",
     "check": "tsc --noEmit -p tsconfig.json",
     "precheck": "node scripts/link-dsh-closure.mjs",
@@ -33,9 +37,38 @@
     "test": "node --test test/*.test.mjs",
     "smoke": "node scripts/smoke-boot.mjs"
   },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.0.4",
+    "@deepseek-ai/schemastery": "3.18.4",
+    "@deepseek-ai/dsh-commands": ">=0.1.7-rc.1",
+    "@deepseek-ai/dsh-llm": ">=0.1.7-rc.1",
+    "@deepseek-ai/dsh-scope": ">=0.1.7-rc.1",
+    "@deepseek-ai/dsh-system-prompt": ">=0.1.7-rc.1",
+    "@deepseek-ai/dsh-tools": ">=0.1.7-rc.1",
+    "@deepseek-ai/dsh-util-values": ">=0.1.7-rc.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-commands": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "typescript": "~5.9.0"
+    "typescript": "~5.9.0",
+    "@deepseek-ai/cordis": "4.0.4",
+    "@deepseek-ai/schemastery": "3.18.4",
+    "@deepseek-ai/dsh-commands": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-llm": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-scope": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-system-prompt": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-tools": "0.1.7-rc.1",
+    "@deepseek-ai/dsh-util-values": "0.1.7-rc.1"
   },
   "dsh": {
     "bundle": {

@@ -33,8 +33,9 @@
  * three latches at once — its tools force-fold out of every prompt (keep and
  * `servers` whitelist exemptions included), it disappears from the catalog,
  * and `mcp_call` refuses it with an enable hint. Each server gets a stable
- * numeric id (1..99, smallest free first) persisted in the dsh settings
- * service (`mcp-adapter` namespace), so ids survive restarts and re-syncs.
+ * numeric id (1..99, smallest free first) persisted in the plugin's own gate
+ * file under the dsh home (`storages/mcp-adapter/gate.json`), so ids survive
+ * restarts and re-syncs.
  *
  * Child-owned projections are preserved: `mcp_call` delegates its
  * `output.render` to the dispatched child and forwards the child's
@@ -53,6 +54,10 @@
  * @module @aiwayds/dsh-mcp-adapter
  */
 
+import { mkdir, rename, writeFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join, resolve as resolvePath } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { ContentBlock, ToolSchema } from '@deepseek-ai/dsh-llm'
@@ -67,13 +72,6 @@ import type { ScopeKey } from '@deepseek-ai/dsh-scope'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-commands'
-// Type-only import: loads dsh-settings' declaration merging (the `settings`
-// service on Context) and the SettingsScope type. dsh-settings
-// 0.1.2-alpha.3 removed the settingsNamespace() runtime helper this file
-// used to call at module load; register() now brand-checks the plain
-// literal below at the type level (SettingsNamespaceInput) and validates
-// the same pattern at runtime via parseSettingsNamespace.
-import type { SettingsScope } from '@deepseek-ai/dsh-settings'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'mcp-adapter'
@@ -121,15 +119,21 @@ const PREFIX_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
 export const MCP_SERVER_ID_LIMIT = 99
 
 /**
- * dsh settings namespace persisting the stable ids and the disabled set.
- * Plain literal: dsh-settings 0.1.2-alpha.3 removed the runtime
- * settingsNamespace() helper this constant used to call (same adaptation as
- * dsh-model-sync / dsh-cron / dsh-vault).
+ * dsh 0.1.7 note: the runtime settings registry this state used to live in
+ * (`settings.register('mcp-adapter', …)` on the 0.1.5 `SettingsScope`) is
+ * gone — 0.1.7 settings are the projection of a plugin's `Config` schema and
+ * volatile fields are user-editable values, which a machine-maintained id
+ * registry must never be. The gate therefore persists through the plugin's
+ * OWN file under the dsh home (same seam as dsh-cron/dsh-vault):
+ * `<dsh home>/storages/mcp-adapter/gate.json`.
  */
-export const MCP_ADAPTER_SETTINGS_NAMESPACE = 'mcp-adapter'
+export const MCP_ADAPTER_STORAGE_DIRNAME = 'mcp-adapter'
+
+/** The gate document file name inside {@link MCP_ADAPTER_STORAGE_DIRNAME}. */
+export const GATE_FILE_NAME = 'gate.json'
 
 /**
- * The persisted gate state (one settings section). `serverIds` maps every
+ * The persisted gate state (one gate.json document). `serverIds` maps every
  * OBSERVED server name to its stable id and is never pruned — enable/disable
  * never recycles an id, so an id always means the same server, even across
  * restarts and temporary re-sync gaps.
@@ -144,8 +148,8 @@ export interface ServerIdRegistry {
 /**
  * Read-side snapshot of the registry the three latches consult. Structurally
  * a superset of {@link ServerIdRegistry}; everything (config objects included)
- * shaped like this qualifies, so production hands frozen `scope.get()` values
- * straight in.
+ * shaped like this qualifies, so production hands the gate store's frozen
+ * mirror straight in.
  */
 export interface ServerGateState {
   readonly serverIds: Readonly<Record<string, number>>
@@ -154,12 +158,6 @@ export interface ServerGateState {
 
 /** Gate snapshot meaning "nothing observed, nothing disabled". */
 export const EMPTY_SERVER_GATE: ServerGateState = { serverIds: {}, disabled: [] }
-
-/** Schema of the persisted `mcp-adapter` settings section. */
-export const SERVER_ID_REGISTRY_SCHEMA = z.object({
-  serverIds: z.dict(z.number().step(1).min(1).max(MCP_SERVER_ID_LIMIT)).default({}),
-  disabled: z.array(z.number().step(1).min(1).max(MCP_SERVER_ID_LIMIT)).default([]),
-}) as unknown as z<ServerIdRegistry>
 
 /** Whether one number is an allocatable server id. */
 function isValidServerId(id: unknown): id is number {
@@ -298,30 +296,136 @@ export function setServerDisabledState(
   }
 }
 
+// ---- Gate persistence (file-backed; the 0.1.5 settings namespace is gone) ----
+
+/**
+ * The live gate handle production hands to the three latches and the /mcp
+ * command: an in-memory mirror loaded once at apply time, written through to
+ * the gate file on every persist. Reads never throw and never touch the disk;
+ * writes may (and the command surface turns a failed write into a structured
+ * error while the mirror keeps its previous value — "state unchanged").
+ */
+export interface GateStore {
+  /** Current normalized snapshot (corrupt input already sanitized away). */
+  get(): ServerGateState
+  /** Persist one complete next registry; the mirror moves only after the file landed. */
+  write(next: ServerIdRegistry): Promise<void>
+}
+
+/** The warning seam {@link createFileGateStore} reports boot-time problems through. */
+export type GateWarn = (message: string) => void
+
+/** Resolve the dsh home (`DSH_HOME`, else `~/.dsh`) — same seam as dsh-cron/dsh-vault. */
+export function resolveDshHome(): string {
+  return process.env.DSH_HOME !== undefined && process.env.DSH_HOME !== ''
+    ? process.env.DSH_HOME
+    : join(homedir(), '.dsh')
+}
+
+/**
+ * Absolute gate directory for one `storageDir` config value: empty (default)
+ * means `<dsh home>/storages/mcp-adapter`, anything else is the override used
+ * verbatim (resolved).
+ */
+export function resolveGateDir(configured: string): string {
+  return configured.trim() === ''
+    ? join(resolveDshHome(), 'storages', MCP_ADAPTER_STORAGE_DIRNAME)
+    : resolvePath(configured)
+}
+
+/**
+ * Load the gate mirror from one gate file. A missing file is the fresh-install
+ * zero state (silent); an unreadable or unparseable one is warned about once
+ * here and degrades to the empty gate — every server counts as enabled, the
+ * fail-open hard requirement.
+ */
+function loadInitialGate(file: string, warn: GateWarn): ServerGateState {
+  try {
+    return normalizeServerGate(JSON.parse(readFileSync(file, 'utf8')))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      warn(
+        `mcp-adapter: the persisted enable/disable state at ${file} is unreadable `
+        + `(${error instanceof Error ? error.message : String(error)}) `
+        + '— starting from an empty gate (every server enabled)',
+      )
+    }
+    return EMPTY_SERVER_GATE
+  }
+}
+
+/**
+ * Build the production gate store over one directory. The initial read is
+ * synchronous (boot-time, once); writes land atomically (tmp file + rename)
+ * so a crash mid-write can never leave a torn document, and the in-memory
+ * mirror only advances after the file is durably renamed into place.
+ */
+export function createFileGateStore(dir: string, warn: GateWarn): GateStore {
+  const file = join(dir, GATE_FILE_NAME)
+  let mirror = loadInitialGate(file, warn)
+  return {
+    get: () => mirror,
+    async write(next: ServerIdRegistry): Promise<void> {
+      // Copy-on-write payload: the document is complete and self-contained,
+      // exactly what the old wholesale settings `replace` guaranteed.
+      const payload = JSON.stringify(
+        { serverIds: { ...next.serverIds }, disabled: [...next.disabled] },
+        null, 2,
+      ) + '\n'
+      await mkdir(dir, { recursive: true })
+      const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
+      await writeFile(tmp, payload, 'utf8')
+      await rename(tmp, file)
+      mirror = normalizeServerGate(next)
+    },
+  }
+}
+
 // ---- Config ----
 
-/** Resolved adapter configuration. */
+/**
+ * Live config reference. 0.1.7 settings contract: volatile `Config` fields
+ * reach `apply` as host-swapped references — `.get()` snapshots the current
+ * value, and a settings-page write swaps the value in place WITHOUT remounting
+ * the plugin, so every consumer must read through the reference per use.
+ */
+export interface VolatileRef<T> {
+  get(): T
+}
+
+/**
+ * Resolved adapter configuration as `apply` receives it. Every knob is
+ * user-tunable from the settings page (entry `dsh-mcp-adapter`) and hot-reloads
+ * without a plugin restart.
+ */
 export interface AdapterConfig {
   /** Tool-name prefix to fold out of assembled prompts. */
-  prefix: string
+  prefix: VolatileRef<string>
   /** Name patterns ("*" wildcard) kept native in the prompt. */
-  keep: string[]
+  keep: VolatileRef<string[]>
   /**
    * Server-name whitelist. Empty (default) folds every prefix-matching tool —
    * the prefix is then a naming convention, not a trust boundary. Non-empty
    * folds/catalogs/dispatches ONLY tools of the listed servers; fold, catalog
    * and dispatch all consult the same list.
    */
-  servers: string[]
+  servers: VolatileRef<string[]>
   /** Max chars per tool description in the mcp_list catalog. */
-  descriptionLimit: number
+  descriptionLimit: VolatileRef<number>
+  /**
+   * Gate storage directory override; empty (default) =
+   * `<dsh home>/storages/mcp-adapter`. Read once at apply time (the store is
+   * built there); changing it takes effect on the next plugin restart.
+   */
+  storageDir: VolatileRef<string>
 }
 
 export const Config = z.object({
-  prefix: z.string().pattern(PREFIX_PATTERN).default(DEFAULT_PREFIX),
-  keep: z.array(String).default([]),
-  servers: z.array(String).default([]),
-  descriptionLimit: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_DESCRIPTION_LIMIT),
+  prefix: z.string().pattern(PREFIX_PATTERN).default(DEFAULT_PREFIX).volatile(),
+  keep: z.array(String).default([]).volatile(),
+  servers: z.array(String).default([]).volatile(),
+  descriptionLimit: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_DESCRIPTION_LIMIT).volatile(),
+  storageDir: z.string().default('').volatile(),
 }) as unknown as z<AdapterConfig>
 
 // ---- Keep-pattern matching (pure) ----
@@ -469,9 +573,9 @@ export interface McpListOptions {
   /** Server-name whitelist; empty or omitted admits every server. */
   servers?: readonly string[]
   /**
-   * Live gate reader (production: fresh `settingsScope.get()` snapshot per
-   * execution). A callback, not a value: the factory is built once at apply
-   * time and must observe later /mcp disable/enable writes.
+   * Live gate reader (production: the file-backed gate store's current
+   * mirror per execution). A callback, not a value: the factory is built
+   * once at apply time and must observe later /mcp disable/enable writes.
    */
   getGate?: () => ServerGateState | undefined
 }
@@ -785,10 +889,10 @@ export interface McpCommandOptions {
   /** Max chars per tool description in rendered listings. */
   descriptionLimit: number
   /**
-   * Live-resolved gate snapshot at invocation time (undefined = the settings
-   * service is not composed, so ids/toggles are absent from all views and
-   * everything renders enabled). A snapshot per invocation keeps these
-   * renderers pure and never stale within one command execution.
+   * Live-resolved gate snapshot at invocation time (undefined = no gate store
+   * is available, so ids/toggles are absent from all views and everything
+   * renders enabled). A snapshot per invocation keeps these renderers pure
+   * and never stale within one command execution.
    */
   gate?: ServerGateState
   /**
@@ -926,7 +1030,7 @@ export interface McpHealthStats {
  *
  * @param schemas - schemas visible to the receiving agent.
  * @param options - adapter knobs (prefix/keep/servers) plus the live gate
- *   snapshot (`gate`) when the settings service is composed.
+ *   snapshot (`gate`) when a gate store is available.
  * @param metaToolsLive - whether both meta-tools resolve to this plugin's
  *   definitions in the receiving agent's scope.
  * @returns the folding health plus the partition behind it.
@@ -1226,7 +1330,7 @@ export function renderMcpConfig(schemas: readonly ToolSchema[], options: McpComm
       hits.length === 0 ? '      (no matching tools)' : `      tools: ${hits.map(schema => annotateDisabled(schema.name)).join(', ')}`,
     )
   }
-  // Persistent gate inventory — only meaningful with a live settings-backed
+  // Persistent gate inventory — only meaningful with a live gate-backed
   // snapshot, so absent snapshots keep the legacy output untouched.
   if (options.gate !== undefined) {
     const mapped = Object.entries(options.gate.serverIds).sort((left, right) => left[1] - right[1])
@@ -1258,16 +1362,15 @@ export interface McpCommandView {
   /** Whether both meta-tools resolve to this plugin's definitions there. */
   metaToolsLive: boolean
   /**
-   * Gate snapshot resolved when the invocation started; `undefined` means the
-   * dsh settings service is not composed in this process (stable ids and
-   * toggles are unavailable; views degrade to enabled-everything).
+   * Gate snapshot resolved when the invocation started; `undefined` means no
+   * gate store is available in this process (stable ids and toggles are
+   * unavailable; views degrade to enabled-everything).
    */
   gate?: ServerGateState
   /**
-   * Persist one complete next registry (production: a wholesale `replace` of
-   * the `mcp-adapter` settings section, mirroring agent-default-model's
-   * save-selection precedent). Absent ⇒ /mcp disable/enable answers with an
-   * explanatory error instead of silently dropping the intent.
+   * Persist one complete next registry (production: an atomic write of the
+   * plugin's gate.json document). Absent ⇒ /mcp disable/enable answers with
+   * an explanatory error instead of silently dropping the intent.
    */
   writeGate?: (next: ServerIdRegistry) => Promise<void>
   /**
@@ -1393,8 +1496,8 @@ async function runServerToggle(
   if (registry === undefined || view.writeGate === undefined) {
     return {
       kind: 'error',
-      text: `"/mcp ${form}" needs the dsh settings service to persist server state, `
-        + 'and it is not composed in this process',
+      text: `"/mcp ${form}" needs the persistent gate store to record server state, `
+        + 'and it is not available in this process',
     }
   }
   const liveServers = new Set(liveServerNames(view.schemas, view.config))
@@ -1568,7 +1671,11 @@ export function delegateFinalizeContent(
 
 /**
  * Build the `mcp_list` meta-tool definition.
- * @param options - catalog knobs (prefix, description limit).
+ * @param options - catalog knobs (prefix, description limit). MAY be a live
+ *   options object (plain getters): the factory reads `prefix`, `servers`,
+ *   `descriptionLimit` and `getGate` through the object on EVERY execution,
+ *   so volatile config can be wired by reference — only the description text
+ *   freezes at factory time.
  * @param listSchemas - visible-schemas source (production: `ctx.tools.schemas`,
  *   called with the calling agent so restrictions are respected).
  * @returns the complete tool definition.
@@ -1621,29 +1728,34 @@ export function createMcpListTool(
 
 /**
  * Build the `mcp_call` meta-tool definition.
- * @param prefix - the configured MCP prefix (dispatch boundary).
+ * @param prefix - the configured MCP prefix (dispatch boundary). A thunk is
+ *   accepted so volatile config is re-read on every dispatch; a plain string
+ *   freezes the boundary at factory time.
  * @param resolve - scope-aware definition resolver (production:
  *   `ctx.tools.get`, called with the calling agent).
- * @param servers - server-name whitelist (default: no filtering).
- * @param getGate - live disabled-server reader (production: fresh
- *   `settingsScope.get()` snapshot per dispatch; default/omitted: nothing is
- *   disabled). Deliberately a callback — the definition object outlives any
- *   one settings snapshot and must observe later /mcp enable/disable writes.
+ * @param servers - server-name whitelist (default: no filtering). A thunk is
+ *   accepted for live volatile config, same as `prefix`.
+ * @param getGate - live disabled-server reader (production: the file-backed
+ *   gate store's current mirror; default/omitted: nothing is disabled).
+ *   Deliberately a callback — the definition object outlives any one gate
+ *   snapshot and must observe later /mcp enable/disable writes.
  * @returns the complete tool definition.
  */
 export function createMcpCallTool(
-  prefix: string,
+  prefix: string | (() => string),
   resolve: (name: string, scope?: ScopeKey) => ToolDefinition | undefined,
-  servers: readonly string[] = [],
+  servers: readonly string[] | (() => readonly string[]) = [],
   getGate?: () => ServerGateState | undefined,
 ): ToolDefinition {
+  const prefixNow = typeof prefix === 'function' ? prefix : () => prefix
+  const serversNow = typeof servers === 'function' ? servers : () => servers
   return {
     name: MCP_CALL_TOOL_NAME,
     description: [
-      `Invoke one MCP tool by its full registered name (like "${prefix}<server>__<tool>").`,
+      `Invoke one MCP tool by its full registered name (like "${prefixNow()}<server>__<tool>").`,
       `First call ${MCP_LIST_TOOL_NAME} to discover tool names and expand the exact input schema,`,
       'then pass { "tool": "<full name>", "arguments": { ... } }.',
-      `Only tools named with the "${prefix}" prefix are dispatchable — anything else is refused.`,
+      `Only tools named with the "${prefixNow()}" prefix are dispatchable — anything else is refused.`,
       'The result is the invoked tool\'s own return value, or a structured { "error": ... } you can correct and retry.',
     ].join(' '),
     parameters: {
@@ -1665,7 +1777,7 @@ export function createMcpCallTool(
         renderDispatched(args, value, name => resolve(name)),
     },
     execute: (args: unknown, exec) =>
-      dispatchMcpCall(args, prefix, name => resolve(name, exec.agent), exec, servers, getGate?.()),
+      dispatchMcpCall(args, prefixNow(), name => resolve(name, exec.agent), exec, serversNow(), getGate?.()),
     // Restore child-owned projections (image attachments): the registry
     // invokes THIS definition's finalizer, so it must forward to the child's
     // with the same exec object dispatch passed to child.execute.
@@ -1683,86 +1795,60 @@ export function createMcpCallTool(
  * both registrations are rolled back, a warning is logged, and NO listener
  * is installed — the official full-schema passthrough stays intact.
  *
- * Server gating: when a dsh settings service is composed, the `mcp-adapter`
- * namespace is registered on it and every gate consumer reads FRESH resolved
- * values through small callbacks — the plugin keeps no in-memory copy that
- * could drift from settings. The read itself is defended too: if the
- * resolved-value lookup throws, consumers see an absent gate (everything
- * enabled) instead of the error, keeping the assemble waterfall alive.
+ * Server gating: the gate mirror loads synchronously once from the plugin's
+ * gate file (`resolveGateDir(config.storageDir.get())`), and every gate
+ * consumer reads the CURRENT mirror through {@link getGate} — the plugin
+ * keeps no stale copy that could drift from /mcp writes. A corrupt or
+ * unreadable document degrades to the empty gate (everything enabled) at
+ * load time, keeping the assemble waterfall alive.
  *
- * Commands: `/mcp` mounts through a runtime `ctx.inject(['commands'], ...)`
- * (same seam as settings), so hosts without the commands service keep this
- * plugin fully functional — one warning, no command. A registration name
- * conflict degrades to the same warning independently.
+ * Config volatility: every knob (prefix/keep/servers/descriptionLimit) is a
+ * volatile reference — 0.1.7 settings-page writes swap values in place
+ * WITHOUT remounting the plugin, so nothing captured at apply time may go
+ * stale: the waterfall, both meta-tools and the /mcp command all re-read
+ * through {@link cfgNow} per use.
+ *
+ * Commands: `/mcp` mounts through a runtime `ctx.inject(['commands'], ...)`,
+ * so hosts without the commands service keep this plugin fully functional —
+ * one warning, no command. A registration name conflict degrades to the same
+ * warning independently.
  *
  * @param ctx - plugin context carrying the tool registry.
- * @param config - resolved adapter configuration.
+ * @param config - resolved adapter configuration (volatile live references).
  */
 export function apply(ctx: Context, config: AdapterConfig): void {
-  const foldOptions: FoldOptions = {
-    prefix: config.prefix,
-    keep: config.keep,
-    servers: config.servers,
-  }
-  const listOptions: McpListOptions = {
-    prefix: config.prefix,
-    descriptionLimit: config.descriptionLimit,
-    servers: config.servers,
-  }
+  const cfgNow = () => ({
+    prefix: config.prefix.get(),
+    keep: config.keep.get(),
+    servers: config.servers.get(),
+    descriptionLimit: config.descriptionLimit.get(),
+  })
 
-  // Optional settings consumption (the canonical inject-scoped pattern): the
-  // registration rides its own child fiber, so disposing it removes exactly
-  // the namespace. Late binding over `settingsScope` means the meta-tools,
-  // waterfall, and command created below observe the mount whenever it lands.
-  let settingsScope: SettingsScope<ServerIdRegistry> | undefined
-  if (typeof ctx.inject === 'function') {
-    ctx.inject(['settings'], (sctx) => {
-      settingsScope = sctx.settings.register(MCP_ADAPTER_SETTINGS_NAMESPACE, SERVER_ID_REGISTRY_SCHEMA)
-      return () => { settingsScope = undefined }
-    })
-  }
-  // One-shot latch: a persistently broken settings provider would otherwise
-  // re-warn on EVERY assembled prompt (getGate runs per waterfall execution).
-  let gateReadWarned = false
-  // Fresh snapshot per read; normalize guards hand-edited documents. The
-  // scope being absent is distinguishable from an empty section: undefined
-  // propagates so toggle commands can name their missing dependency.
-  const getGate = (): ServerGateState | undefined => {
-    const scope = settingsScope
-    if (scope === undefined) return undefined
-    try {
-      return normalizeServerGate(scope.get())
-    } catch (error) {
-      // Fail-open, hard requirement: a throwing read must never blow up the
-      // system-prompt/assemble waterfall or a /mcp invocation. Gate-less
-      // means every server counts as enabled — visibility only ever grows.
-      if (!gateReadWarned) {
-        gateReadWarned = true
-        ctx.logger.warn(
-          `mcp-adapter: reading the persisted enable/disable state failed `
-          + `(${error instanceof Error ? error.message : String(error)}) `
-          + '— treating every server as enabled',
-        )
-      }
-      return undefined
-    }
-  }
-  const writeGate = async (next: ServerIdRegistry): Promise<void> => {
-    const scope = settingsScope
-    if (scope === undefined) throw new Error('settings service went away before the write')
-    // Wholesale replace (not update): we always hold the complete next
-    // section, and replace cannot merge stale keys back under us.
-    await scope.replace({ serverIds: { ...next.serverIds }, disabled: [...next.disabled] })
-  }
+  // Persistent enable/disable state: file-backed gate store (the 0.1.5
+  // settings namespace is gone; volatile fields are for user-facing values,
+  // which a machine id registry must never be). Reads come from the mirror,
+  // writes go through atomically; the storage dir is read once — moving it
+  // takes effect on the next plugin restart.
+  const store = createFileGateStore(resolveGateDir(config.storageDir.get()), message => ctx.logger.warn(message))
+  const getGate = (): ServerGateState => store.get()
+  const writeGate = (next: ServerIdRegistry): Promise<void> => store.write(next)
 
+  // Live options object: getters re-resolve volatile config per execution, so
+  // catalog/dispatch immediately follow settings-page edits (the list tool's
+  // description text is the only factory-time freeze, and it is cosmetic).
   const listDefinition = createMcpListTool(
-    { ...listOptions, getGate },
+    {
+      get prefix() { return cfgNow().prefix },
+      get servers() { return cfgNow().servers },
+      get descriptionLimit() { return cfgNow().descriptionLimit },
+      getGate,
+    },
     scope => ctx.tools.schemas(scope),
   )
   const callDefinition = createMcpCallTool(
-    config.prefix,
+    () => cfgNow().prefix,
     (name, scope) => ctx.tools.get(name, scope),
-    config.servers,
+    () => cfgNow().servers,
     getGate,
   )
 
@@ -1793,7 +1879,10 @@ export function apply(ctx: Context, config: AdapterConfig): void {
     // missing, shadowed, or foreign `mcp_list`/`mcp_call` means passthrough.
     const metaToolsLive = ctx.tools.get(MCP_LIST_TOOL_NAME, context.scope) === listDefinition
       && ctx.tools.get(MCP_CALL_TOOL_NAME, context.scope) === callDefinition
-    return foldPromptAssembly(assembled, foldOptions, metaToolsLive, getGate())
+    // Volatile knobs are re-read per assembly: settings-page edits reach the
+    // next prompt without a plugin remount.
+    const { prefix, keep, servers } = cfgNow()
+    return foldPromptAssembly(assembled, { prefix, keep, servers }, metaToolsLive, getGate())
   })
 
   // Status + server toggles on the platform command service (visible in TUI
@@ -1825,18 +1914,13 @@ export function apply(ctx: Context, config: AdapterConfig): void {
             const schemas = ctx.tools.schemas(scope)
             const metaToolsLive = ctx.tools.get(MCP_LIST_TOOL_NAME, scope) === listDefinition
               && ctx.tools.get(MCP_CALL_TOOL_NAME, scope) === callDefinition
-            // ONE snapshot per execution keeps config.gate and view.gate identical.
+            // ONE snapshot per execution keeps config.gate and view.gate identical;
+            // volatile knobs are re-read per invocation (live settings-page edits).
             const gate = getGate()
             return executeMcpCommand({
               rawInput: invocation.rawInput,
               schemas,
-              config: {
-                prefix: config.prefix,
-                keep: config.keep,
-                servers: config.servers,
-                descriptionLimit: config.descriptionLimit,
-                gate,
-              },
+              config: { ...cfgNow(), gate },
               metaToolsLive,
               gate,
               signal: invocation.signal,

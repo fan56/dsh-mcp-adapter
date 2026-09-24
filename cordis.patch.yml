@@ -26,6 +26,12 @@
 #                       client's registrations)
 #   descriptionLimit:   max chars per tool description in the mcp_list
 #                       catalog (default 200)
+#   storageDir:         gate storage directory override; empty (default) =
+#                       <dsh home>/storages/mcp-adapter
+#
+# All five keys are volatile (dsh 0.1.7 settings contract): they appear on
+# the plugin's settings page (entry `dsh-mcp-adapter`) and hot-reload there
+# without a plugin restart. This `config:` form keeps working too.
 
 - insert:
     - id: dsh-mcp-adapter
