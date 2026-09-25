@@ -34,6 +34,10 @@ import {
   apply,
 } from '../lib/index.js'
 
+/** Scratch dsh home so the gate store's legacy absorption never sees the real ~/.dsh. */
+const HOME = mkdtempSync(join(tmpdir(), 'mcp-adapter-gate-home-'))
+process.env.DSH_HOME = HOME
+
 /** Fresh scratch storage dir per call — gate files must never leak across tests. */
 function freshDir() {
   return mkdtempSync(join(tmpdir(), 'mcp-adapter-gate-'))

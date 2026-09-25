@@ -25,6 +25,11 @@ import {
 /** Scratch storage dir so apply()'s gate store never touches a real dsh home. */
 const TMP = mkdtempSync(join(tmpdir(), 'mcp-adapter-test-'))
 
+// The one-time legacy-settings absorption in createFileGateStore resolves the
+// dsh home — pin it to this file's scratch dir so apply() never reads (or
+// writes a marker into) the developer's real ~/.dsh during tests.
+process.env.DSH_HOME = TMP
+
 /**
  * Runtime config as apply() consumes it since 0.1.7: volatile refs resolved
  * straight from the plugin's Config schema (the template's test-injection

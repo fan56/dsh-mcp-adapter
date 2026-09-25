@@ -55,9 +55,9 @@
  */
 
 import { mkdir, rename, writeFile } from 'node:fs/promises'
-import { readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, resolve as resolvePath } from 'node:path'
+import { basename, join, resolve as resolvePath } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { ContentBlock, ToolSchema } from '@deepseek-ai/dsh-llm'
@@ -359,10 +359,23 @@ function loadInitialGate(file: string, warn: GateWarn): ServerGateState {
  * synchronous (boot-time, once); writes land atomically (tmp file + rename)
  * so a crash mid-write can never leave a torn document, and the in-memory
  * mirror only advances after the file is durably renamed into place.
+ *
+ * Legacy absorption (one-time, 0.1.5 → 0.1.7): on a FRESH gate — no
+ * gate.json yet — the machine state from the removed settings registry is
+ * absorbed once from the host's legacy settings documents (see
+ * {@link absorbLegacyGate}). Opt-in through `options.home`: the legacy
+ * documents are a HOME-level concern (not this store's `dir`), and stores
+ * built without a home (bare test harnesses) stay exactly as isolated as
+ * before.
  */
-export function createFileGateStore(dir: string, warn: GateWarn): GateStore {
+export function createFileGateStore(dir: string, warn: GateWarn, options: GateStoreOptions = {}): GateStore {
   const file = join(dir, GATE_FILE_NAME)
+  const hadGateFile = existsSync(file)
   let mirror = loadInitialGate(file, warn)
+  if (!hadGateFile) {
+    // Fresh install: one chance to take over the pre-0.1.7 gate state.
+    mirror = absorbLegacyGate(mirror, dir, warn, options)
+  }
   return {
     get: () => mirror,
     async write(next: ServerIdRegistry): Promise<void> {
@@ -378,6 +391,217 @@ export function createFileGateStore(dir: string, warn: GateWarn): GateStore {
       await rename(tmp, file)
       mirror = normalizeServerGate(next)
     },
+  }
+}
+
+// ---- Legacy settings absorption (one-time, 0.1.5 → 0.1.7) ----
+
+/**
+ * dsh 0.1.7 renamed the old `<home>/settings.yaml` to
+ * `settings.yaml.imported` after a one-shot import keyed by "section name =
+ * entry id". This plugin's old `mcp-adapter:` section (the machine-maintained
+ * id registry / disabled set) does not match the entry id `dsh-mcp-adapter`
+ * and was silently dropped by the host — the state lives on only in the
+ * renamed document. {@link absorbLegacyGate} recovers it once into the
+ * plugin's own gate.json.
+ */
+
+/** Legacy host settings documents, in read priority order. */
+export const LEGACY_SETTINGS_FILES = ['settings.yaml.imported', 'settings.yaml'] as const
+
+/** Legacy top-level section name in the old settings document. */
+export const LEGACY_GATE_SECTION = 'mcp-adapter'
+
+/** Audit marker file name: `<home>/storages/mcp-adapter/<name>`. */
+export const LEGACY_IMPORT_MARKER = 'legacy-import.json'
+
+/** Marker outcomes written for every settled absorption pass. */
+export type LegacyGateOutcome =
+  | 'imported' // state absorbed and persisted to gate.json, marker written
+  | 'no-op' // section found but nothing survived decoding/normalization, marker written
+  | 'no-legacy' // neither legacy document exists, marker written
+  | 'no-section' // documents exist without an `mcp-adapter:` section, marker written
+
+/**
+ * Decode one YAML scalar of the old settings document — the shapes the 0.1.5
+ * writer actually produced (plain scalars, booleans, and quoted single-line
+ * flow-JSON payloads). A value that opens a quote it does not close on the
+ * same line is a FOLDED long scalar (dumpers wrap at 80 columns):
+ * unparseable here by design, so the key is skipped — never a half-read
+ * value.
+ */
+function decodeLegacyScalar(raw: string): unknown {
+  const value = raw.trim()
+  if (value === '' || value === 'null' || value === '~') return undefined
+  if (value === 'true') return true
+  if (value === 'false') return false
+  const quote = value[0]
+  const closed = value.length >= 2 && value[value.length - 1] === quote
+  if (quote === "'" || quote === '"') {
+    if (!closed || value.length < 2) return undefined // folded / unterminated — skip
+    if (quote === '"') {
+      // Double-quoted payloads are JSON-compatible as-is.
+      try {
+        return JSON.parse(value)
+      } catch {
+        return undefined
+      }
+    }
+    return value.slice(1, -1).replace(/''/g, "'")
+  }
+  const hash = value.indexOf(' #')
+  return hash >= 0 ? value.slice(0, hash).trim() : value
+}
+
+/**
+ * Extract the top-level `mcp-adapter:` section of the old settings document.
+ * Handles both shapes the 0.1.5 writer produced:
+ * - single-line values (`serverIds: '{"fs": 1}'`, `disabled: '[1]'`);
+ * - block collections (`serverIds:` followed by deeper-indented
+ *   `name: <int>` lines; `disabled:` followed by `- <int>` lines).
+ * Everything else (comments, folded scalars, nested junk) is skipped.
+ * undefined = no section found. Pure function — tests run it against
+ * literal strings.
+ */
+export function legacyGateSection(text: string): { serverIds?: unknown; disabled?: unknown } | undefined {
+  const lines = text.split('\n')
+  const start = lines.findIndex(line => /^mcp-adapter:\s*(#.*)?$/.test(line))
+  if (start < 0) return undefined
+  const section: { serverIds?: unknown; disabled?: unknown } = {}
+  const ids: Record<string, number> = {}
+  const seq: number[] = []
+  let block: { key: 'serverIds' | 'disabled'; indent: number } | undefined
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index]
+    if (line.trim() === '' || /^\s*#/.test(line)) continue
+    if (/^\S/.test(line)) break // the next top-level key ends the section
+    const indent = line.length - line.trimStart().length
+    if (block !== undefined && indent > block.indent) {
+      // Children of an open block collection carry the machine state.
+      if (block.key === 'serverIds') {
+        const entry = /^([^\s:#]+):\s*(\d+)\s*(?:#.*)?$/.exec(line.trim())
+        if (entry !== null) ids[entry[1]] = Number(entry[2])
+      } else {
+        const entry = /^-\s*(\d+)\s*(?:#.*)?$/.exec(line.trim())
+        if (entry !== null) seq.push(Number(entry[1]))
+      }
+      continue
+    }
+    block = undefined
+    const match = /^([A-Za-z][A-Za-z0-9_-]*):[ \t]?(.*)$/.exec(line.trim())
+    if (match === null) continue // nested shape we do not model — skip the line
+    const [, key, rawValue] = match
+    if (key !== 'serverIds' && key !== 'disabled') continue
+    const value = rawValue.trim()
+    if (value === '') {
+      // Opens a block collection (or is null — the children decide).
+      block = { key, indent }
+      continue
+    }
+    section[key] = decodeLegacyScalar(rawValue)
+  }
+  if (Object.keys(ids).length > 0) section.serverIds = ids
+  if (seq.length > 0) section.disabled = seq
+  return section
+}
+
+/**
+ * Turn one decoded section into the raw candidate {@link normalizeServerGate}
+ * sanitizes: flow-JSON strings are JSON-parsed (malformed → undefined, the
+ * key degrades to "absent"), already-decoded block collections pass through.
+ */
+export function legacyGateCandidate(section: { serverIds?: unknown; disabled?: unknown }): { serverIds?: unknown; disabled?: unknown } {
+  const fromFlow = (value: unknown): unknown => {
+    if (typeof value !== 'string') return value
+    try {
+      return JSON.parse(value)
+    } catch {
+      return undefined
+    }
+  }
+  return { serverIds: fromFlow(section.serverIds), disabled: fromFlow(section.disabled) }
+}
+
+/** Construction options for {@link createFileGateStore} beyond the two
+ *  historical arguments (all optional — bare harnesses change nothing). */
+export interface GateStoreOptions {
+  /** Summary-line seam for the absorption (default: silent). */
+  info?: GateWarn
+  /**
+   * The dsh home holding the legacy settings documents and the audit marker
+   * (production: `resolveDshHome()` at the call site). Absorption runs ONLY
+   * when a home is provided — a store built without one never reads outside
+   * its own directory.
+   */
+  home?: string
+}
+
+/**
+ * The one-time absorption pass over the legacy documents. Marker semantics
+ * match the sibling plugins: written for EVERY settled outcome EXCEPT the
+ * retry-worthy failure (an unexpected error — no marker, the next boot
+ * retries); a present marker short-circuits the whole pass (idempotent — a
+ * later manual edit of the imported file must not resurrect old values).
+ * Returns the mirror to run on (the absorbed state, or the input unchanged).
+ */
+function absorbLegacyGate(current: ServerGateState, dir: string, warn: GateWarn, options: GateStoreOptions): ServerGateState {
+  try {
+    const home = options.home
+    if (home === undefined) return current
+    const markerPath = join(home, 'storages', MCP_ADAPTER_STORAGE_DIRNAME, LEGACY_IMPORT_MARKER)
+    if (existsSync(markerPath)) return current
+    const writeMarker = (marker: Record<string, unknown>): void => {
+      try {
+        mkdirSync(join(markerPath, '..'), { recursive: true })
+        writeFileSync(markerPath, `${JSON.stringify(marker, null, 2)}\n`)
+      } catch {
+        // contained — a missing audit file only costs a re-scan next boot
+      }
+    }
+    const source = LEGACY_SETTINGS_FILES
+      .map(name => join(home, name))
+      .find(path => existsSync(path))
+    if (source === undefined) {
+      writeMarker({ at: new Date().toISOString(), outcome: 'no-legacy', source: undefined })
+      return current
+    }
+    const section = legacyGateSection(readFileSync(source, 'utf8'))
+    const absorbed = normalizeServerGate(section === undefined ? {} : legacyGateCandidate(section))
+    const serverIdCount = Object.keys(absorbed.serverIds).length
+    if (serverIdCount === 0 && absorbed.disabled.length === 0) {
+      writeMarker({ at: new Date().toISOString(), outcome: section === undefined ? 'no-section' : 'no-op', source })
+      return current
+    }
+    // Persist IMMEDIATELY (sync atomic tmp+rename, the write-through pose):
+    // gate.json must exist the moment the state was taken over, so ids and
+    // toggles visibly survive the upgrade without waiting for a first write.
+    const file = join(dir, GATE_FILE_NAME)
+    const payload = JSON.stringify(
+      { serverIds: { ...absorbed.serverIds }, disabled: [...absorbed.disabled] },
+      null, 2,
+    ) + '\n'
+    mkdirSync(dir, { recursive: true })
+    const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
+    writeFileSync(tmp, payload, 'utf8')
+    renameSync(tmp, file)
+    writeMarker({
+      at: new Date().toISOString(),
+      outcome: 'imported',
+      source,
+      serverIds: serverIdCount,
+      disabled: absorbed.disabled.length,
+    })
+    options.info?.(
+      `mcp-adapter: legacy settings import (${basename(source)} → ${MCP_ADAPTER_STORAGE_DIRNAME}/${GATE_FILE_NAME}): `
+      + `serverIds=${serverIdCount}, disabled=${absorbed.disabled.length}`,
+    )
+    return absorbed
+  } catch (error) {
+    warn(
+      `mcp-adapter: legacy settings absorption failed (ignored — starting from the current gate, retried next boot): `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    )
+    return current
   }
 }
 
@@ -1828,8 +2052,13 @@ export function apply(ctx: Context, config: AdapterConfig): void {
   // settings namespace is gone; volatile fields are for user-facing values,
   // which a machine id registry must never be). Reads come from the mirror,
   // writes go through atomically; the storage dir is read once — moving it
-  // takes effect on the next plugin restart.
-  const store = createFileGateStore(resolveGateDir(config.storageDir.get()), message => ctx.logger.warn(message))
+  // takes effect on the next plugin restart. On a fresh gate (no gate.json)
+  // the store absorbs the pre-0.1.7 `mcp-adapter:` settings state once —
+  // fully contained, audit marker under storages/mcp-adapter.
+  const store = createFileGateStore(resolveGateDir(config.storageDir.get()), message => ctx.logger.warn(message), {
+    info: message => ctx.logger.info?.(message),
+    home: resolveDshHome(),
+  })
   const getGate = (): ServerGateState => store.get()
   const writeGate = (next: ServerIdRegistry): Promise<void> => store.write(next)
 

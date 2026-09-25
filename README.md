@@ -68,7 +68,7 @@ One thing deliberately **stays**: the plugin's gate file at `~/.dsh/storages/mcp
 
 To purge that state too, delete the `storages/mcp-adapter/` directory yourself; ids will be re-allocated from scratch on reinstall.
 
-Upgrading from a dsh 0.1.5 install: the old `mcp-adapter:` section of `settings.yaml` is **not** auto-imported (the 0.1.7 host renames that file to `settings.yaml.imported` after its one-shot import, and the section name does not match this plugin's entry id). The original values stay readable in `settings.yaml.imported`; servers you had disabled need one `/mcp disable <id>` each to re-latch. Your `config:` values in the profile patch carry over unchanged.
+Upgrading from a dsh 0.1.5 install: the old `mcp-adapter:` section of `settings.yaml` (which the 0.1.7 host renames to `settings.yaml.imported` after its one-shot import, since the section name does not match this plugin's entry id) is **absorbed once automatically**: on the next plugin boot, if no gate file exists yet, the stable ids and the disabled set are read from `settings.yaml.imported` (fallback: the still-present `settings.yaml`), sanitized and written straight into `gate.json` — no `/mcp disable <id>` re-latching needed. The pass is recorded in `<dsh home>/storages/mcp-adapter/legacy-import.json` (a present marker means it never re-runs; an existing gate.json is left untouched). Your `config:` values in the profile patch carry over unchanged.
 
 ## Config
 

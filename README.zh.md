@@ -60,7 +60,7 @@ dsh plugin --profile <name> remove @aiwayds/dsh-mcp-adapter
 
 连这份状态也想清掉的话，请自行删除 `storages/mcp-adapter/` 目录；重装时 id 会重新分配。
 
-从 dsh 0.1.5 升级：旧 `settings.yaml` 里的 `mcp-adapter:` 小节**不会**自动迁移（0.1.7 宿主首次启动时把该文件一次性导入并改名为 `settings.yaml.imported`，而旧段名与本插件 entry id 不同名）。原文仍可在 `settings.yaml.imported` 里查看；此前 disable 过的 server 需各补一条 `/mcp disable <id>` 重新闩上。profile patch 里该 entry 的 `config:` 配置原样继承，不受影响。
+从 dsh 0.1.5 升级：旧 `settings.yaml` 里的 `mcp-adapter:` 小节（0.1.7 宿主首次启动时把该文件一次性导入并改名为 `settings.yaml.imported`，旧段名与本插件 entry id 不同名）会被**一次性自动承接**：下次插件启动时若尚无门闩文件，则从 `settings.yaml.imported`（兜底仍在的 `settings.yaml`）读取 stable id 与 disabled 门闩，消毒后直接写入 `gate.json`——无需再逐条 `/mcp disable <id>` 重新闩上。承接过程记录在 `<dsh home>/storages/mcp-adapter/legacy-import.json`（该 marker 存在即永不重跑；已有 gate.json 则完全不介入）。profile patch 里该 entry 的 `config:` 配置原样继承，不受影响。
 
 ## 配置
 
