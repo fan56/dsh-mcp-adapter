@@ -410,7 +410,9 @@ test('apply(): registers the /mcp command with the declared contract', () => {
   assert.notEqual(definition, undefined)
   assert.equal(definition.name, 'mcp')
   assert.equal(definition.description, 'Show MCP status; disable/enable MCP servers')
-  assert.deepEqual(definition.input, { hint: '[list [server|tool] | config | disable <id> | enable <id>]' })
+  // `suggest` joined the surface with the jev keep-suggestion seam; the
+  // description stays the pre-seam one (the hint is what completion shows).
+  assert.deepEqual(definition.input, { hint: '[list [server|tool] | config | suggest | disable <id> | enable <id>]' })
 })
 
 test('apply(): the handler answers from the invoking agent\'s scope, live-aware', async () => {

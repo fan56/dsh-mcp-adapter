@@ -16,7 +16,7 @@ This plugin keeps the official `dsh-mcp-client` as the connection layer (transpo
 
 - every `mcp__*` tool schema is **folded out** of the assembled prompt (`system-prompt/assemble` waterfall);
 - two **constant meta-tools** take their place, so standing prompt cost is O(1) in the number of servers/tools:
-  - **`mcp_list`** — compact catalog (tool names + truncated descriptions, no schemas); pass `tool` to expand one tool's full schema on demand, `server` to filter, `verbose` for everything;
+  - **`mcp_list`** — compact catalog (tool names + truncated descriptions, no schemas); pass `tool` to expand one tool's full schema on demand, `server` to filter, `query` for a relevance-ranked shortlist, `verbose` for everything;
   - **`mcp_call`** — dispatch `{ tool, arguments }` to the still-registered definition, passing the run context through.
 
 Tools stay registered in `ctx.tools`, so TUI rendering and `tools.restrict()` masking keep working — only the prompt payload changes. A folded, constant tool list is also friendlier to KV-prefix caching than upstream's per-resync generation swap.
@@ -79,8 +79,17 @@ Upgrading from a dsh 0.1.5 install: the old `mcp-adapter:` section of `settings.
 | `servers` | `[]` | server-name whitelist: when non-empty, only these servers' tools are folded / cataloged / dispatchable (all three consult the same list) |
 | `descriptionLimit` | `200` | max chars per tool description in the `mcp_list` catalog |
 | `storageDir` | `""` | gate storage directory override; empty = `<dsh home>/storages/mcp-adapter` (read once at plugin start — moving it takes effect on restart) |
+| `jevEnabled` | `false` | System One master switch — **default off**: false means zero decision calls anywhere, and the usage counters keep recording |
+| `jevBackend` | `"zen"` | decision backend: `zen` (free opencode-zen tier) / `native` (typesafe first-party) / `openrouter`; each needs its own API key (`JEV_ZEN_API_KEY` / `TYPESAFE_API_KEY` / `OPENROUTER_API_KEY`, or the macOS keychain) |
+| `jevModel` | `""` | pinned model id; empty = the backend's own default resolved at call time (`jev-1.13-free` / `jev-1.13.0` / `typesafe/jev-1.13`) — an upgrade is a deliberate act |
+| `jevTimeoutMs` | `3000` | per-request timeout in ms; one attempt, no retry — the calling lane's next cadence is the retry |
+| `jevSecretFile` | `""` | extra literal secrets for the outbound secret gate (`JEV_SECRET_FILE` semantics); swapping the path reloads the list |
+| `jevLayaFallback` | `false` | **default off**: also call a local laya endpoint on every decision request; its answer is logged for comparison and takes over only when the primary backend fails |
+| `jevLayaUrl` | `"http://127.0.0.1:8000/v1/systemone"` | that local laya-serve endpoint |
 
-Every field is declared **volatile** (the dsh 0.1.7 settings contract): all five appear on the plugin's settings page under the `dsh-mcp-adapter` entry, and editing them there applies **without restarting the plugin** — the fold boundary, catalog and dispatch pick the new values up on their very next use. The `config:` block in your profile patch keeps working exactly as before.
+The last seven rows are the System One decision layer ([below](#self-evolution-system-one)); all of them are opt-in, and the default install makes no outbound decision call at all.
+
+Every field is declared **volatile** (the dsh 0.1.7 settings contract): all twelve appear on the plugin's settings page under the `dsh-mcp-adapter` entry, and editing them there applies **without restarting the plugin** — the fold boundary, catalog and dispatch pick the new values up on their very next use, and the `jev*` switches are re-read the same way, so flipping `jevEnabled` in the settings page takes effect on the very next dispatch. (`storageDir` is the one exception: the storage location itself is read once at plugin start, as its row says.) The `config:` block in your profile patch keeps working exactly as before.
 
 ```yaml
 config:
@@ -93,6 +102,42 @@ config:
 ```
 
 **Trust boundary:** by default every `prefix`-matching tool is folded — the prefix is a naming convention, not a security boundary, so tools registered by third-party plugins that happen to use `mcp__*` names fold too. To trust only the official client's servers, list them explicitly in `servers`; everything else stays native (still callable directly, just outside the meta-tools).
+
+## Self-evolution (System One)
+
+An optional decision layer, **off by default**: with `jevEnabled: false` the plugin makes no outbound decision call anywhere and behaves exactly as it did before. With it on, three things happen — and all three are advisory.
+
+**Usage accounting (always on, never networked).** Every finished `mcp_call` dispatch, successes and failures alike, is counted per tool (`calls`, `errors`, first/last used) into `usage.json` in the plugin's own gate directory, right beside `gate.json`. This runs regardless of `jevEnabled`, so turning the switch on later reuses everything already counted.
+
+**Keep suggestions (the self-evolving part).** Every 20 recorded calls — crossing 20, 40, 60 … — the plugin asks the decision backend, in **one batched request fired in the background**, which of the currently *folded* tools that were actually called earn a permanent place in every prompt instead of being looked up and expanded on every use. The dispatch that crossed the threshold returns long before any of this runs; nothing awaits it. The answer is written to `suggestions.json`; a failed round leaves the previous batch exactly as it was.
+
+**Viewing them.** `/mcp suggest` renders the current batch — probability, band, the usage evidence behind it, and the `keep` fragment the row would translate to — plus the recorded totals. The view says so itself: `display only — nothing was written to keep, prefix, or the server gate.` You paste the fragment into your own config; **this plugin never edits your configuration**, and no decision path ever writes `keep`, `prefix` or the server gate on its own.
+
+The same backend, asked by the model rather than by the counter, powers the two model-facing searches:
+
+- `mcp_list { "query": "<what you want to do>" }` — a **subset** view: a lexical prefilter over tool names and descriptions first (deterministic, no network), then an optional rerank of that shortlist. The answer says how many tools matched in total and points back at the unfiltered catalog; a no-argument `mcp_list` call is still the full catalog, and a no-query call makes no decision call at all.
+- `mcp_call` with an unregistered tool name — the error keeps its original sentence and gains a `Did you mean: "…"?` tail, ordered by a lexical near-miss pass (edit distance first, then shared name tokens) and optionally reranked. The tail always labels where its order came from (`lexical` or `jev reranked`), so an unranked guess never reads like a ranked one.
+
+**Fail-open:** an unreachable, slow or unhelpful backend is indistinguishable from a disabled one — every decision path falls back to the lexical behavior it had before, and a failed suggestion round costs you that round's rows and nothing else.
+
+**Privacy:** the counters, the suggestions and the decision log (`decisions.jsonl`) never leave the machine — they are three files in the gate directory. With `jevEnabled` on, tool names, the leading 200 chars of their descriptions, the usage counts and the model's own query text **do** go out to the decision backend as the question context; every outbound body is scanned by a built-in secret gate (JWT, provider keys, GitHub/Slack/AWS tokens, PEM blocks, plus whatever literals you list in `jevSecretFile`) and a hit aborts the call before anything leaves the process. `jevBackend` decides where: `zen` (the free opencode-zen tier, default), `native` (typesafe first-party) or `openrouter`. The local laya pace-maker (`jevLayaFallback`) is off by default.
+
+### Not the local laya backend — not yet (measured against laya 0.3.20)
+
+**Leave `jevLayaFallback` off.** Measured head-to-head against the free `zen` tier on this plugin's own three seams, with real MCP tool catalogs driven through `jevAskDual` in parallel:
+
+| Seam | zen (free) | laya 0.3.20 | pure lexical |
+| --- | --- | --- | --- |
+| keep suggestions (12 tools, batched noul) | AUC **1.000** — hot 0.71 / borderline 0.48 / fold 0.11 | AUC **0.333**, worse than chance: every probability lands in 51–55% | — |
+| `mcp_list {query}` ranking (10 queries) | **8/10** | 4/10 — ranks `read_file` below a SQL `query` | 6/10 |
+| did-you-mean rerank (6 misspellings) | 5/6 | 4/6 | 5/6 |
+| Chinese query, semantic fallback (5 queries) | **5/5** | 1/5 — anchors on one tool regardless of the query | 0 (no lexical match) |
+
+laya answers roughly 8–10× faster (70 ms–1 s vs 0.6–6 s), but the discrimination is not close. It cannot read the call-frequency signal the keep suggestion is *about* — a tool called 412 times and one called once come back at the same confidence — and cross-language query matching, which the catalog seam leans on, is where it collapses outright. laya's own runtime warns that the bundled checkpoint's confidence values are uncalibrated.
+
+So the pace-maker stays a degraded-mode safety net only: when the primary backend fails, laya's answer takes over **degraded** — relative order only, never absolute scores against the calibrated bands, and keep suggestions are skipped that round rather than shown with an uncalibrated number. Both sources' verdicts still land in `decisions.jsonl`, which makes the comparison free to run continuously.
+
+**Revisit when** laya ships a typed-decisions checkpoint (or a version whose calibration is published instead of warned about) and this table inverts — then re-measure against your own catalogs before believing it.
 
 ## Notes
 
@@ -110,7 +155,8 @@ The plugin registers one slash command on the platform `commands` service — co
 |---|---|
 | `/mcp` or `/mcp list` | Tree overview — every server line carries its stable `[<id>]`; disabled ones show `⏸ disabled` and hide their tools; closed by a folding-health footer |
 | `/mcp list <name>` | `<name>` matching a server → that server's full tool list (a disabled server adds a `⏸` note); matching a full tool name → full description + complete input schema |
-| `/mcp config` | The effective `prefix` / `keep` / `servers` / `descriptionLimit`, each with its hitting tools, plus the persistent enable/disable inventory |
+| `/mcp config` | The effective `prefix` / `keep` / `servers` / `descriptionLimit`, each with its hitting tools, plus the persistent enable/disable inventory, the seven `jev*` settings and the recorded usage counters |
+| `/mcp suggest` | The current keep-suggestion batch: per tool a probability, a band, the usage evidence and the exact `keep` fragment, plus the recorded totals. Read-only: it writes nothing to `keep`, `prefix` or the gate |
 | `/mcp disable <id>` | Latch a whole server off: its tools force-fold out of every prompt — keep and `servers` exemptions included — it disappears from the `mcp_list` catalog, and `mcp_call` refuses it with an `/mcp enable <id>` hint |
 | `/mcp enable <id>` | Restore it under the same stable id |
 

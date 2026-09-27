@@ -62,6 +62,28 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { ContentBlock, ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+// System One (jev) decision wiring: the seven volatile settings keys, the
+// decisions.jsonl telemetry sink, the three business seams, and the pure
+// lexical rankers every seam degrades to.
+import { JEV_CONFIG_FIELDS } from './jev/config.ts'
+import type { JevConfigValue } from './jev/config.ts'
+import { createDecisionLog } from './jev/log.ts'
+import { askKeepSuggestions, rankDidYouMean, rankListQuery } from './jev/seams.ts'
+import type { JevRuntime } from './jev/seams.ts'
+import { didYouMeanCandidates, didYouMeanMessage, mergeNameOrder, rankByQuery, tokenize } from './rank.ts'
+import type { DidYouMeanSource, RankCandidate } from './rank.ts'
+import { DID_YOU_MEAN_LIMIT, LIST_RESULT_LIMIT, RANK_CANDIDATE_LIMIT } from './rank.ts'
+import {
+  createUsageStore,
+  keepSuggestionFragment,
+  readSuggestions,
+  shouldRunSuggestBatch,
+  usageSuggestCandidates,
+  usageToolCount,
+  writeSuggestions,
+  SUGGEST_BATCH_EVERY,
+} from './usage.ts'
+import type { SuggestionRecord, UsageStore } from './usage.ts'
 // alpha.3 split package: JsonValue no longer re-exports from the dsh-tools
 // root (it lives in dsh-util-values now).
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
@@ -621,8 +643,15 @@ export interface VolatileRef<T> {
  * Resolved adapter configuration as `apply` receives it. Every knob is
  * user-tunable from the settings page (entry `dsh-mcp-adapter`) and hot-reloads
  * without a plugin restart.
+ *
+ * The seven `jev*` keys are the System One decision settings (see
+ * ./jev/config.ts): the master switch, the backend/model to ask, the request
+ * timeout, the outbound secret list, and the local laya pace-maker. They are
+ * spread into {@link Config} from `JEV_CONFIG_FIELDS` so the settings schema
+ * and this interface cannot drift, and they are read through their volatile
+ * refs per use like every other knob.
  */
-export interface AdapterConfig {
+export interface AdapterConfig extends JevConfigValue {
   /** Tool-name prefix to fold out of assembled prompts. */
   prefix: VolatileRef<string>
   /** Name patterns ("*" wildcard) kept native in the prompt. */
@@ -639,12 +668,15 @@ export interface AdapterConfig {
   /**
    * Gate storage directory override; empty (default) =
    * `<dsh home>/storages/mcp-adapter`. Read once at apply time (the store is
-   * built there); changing it takes effect on the next plugin restart.
+   * built there; changing it takes effect on the next plugin restart).
    */
   storageDir: VolatileRef<string>
 }
 
 export const Config = z.object({
+  // System One decision settings (master switch defaults to false: a fresh
+  // install makes ZERO jev calls and behaves exactly like the pre-jev plugin).
+  ...JEV_CONFIG_FIELDS,
   prefix: z.string().pattern(PREFIX_PATTERN).default(DEFAULT_PREFIX).volatile(),
   keep: z.array(String).default([]).volatile(),
   servers: z.array(String).default([]).volatile(),
@@ -802,6 +834,19 @@ export interface McpListOptions {
    * once at apply time and must observe later /mcp disable/enable writes.
    */
   getGate?: () => ServerGateState | undefined
+  /**
+   * Optional async relevance reranker for `{ query }` calls ONLY (production:
+   * the System One seam). Called with the candidate pool — the lexical
+   * shortlist, or the whole visible catalog when the prefilter matched
+   * nothing — and resolves to the preferred order, or to `undefined` to keep
+   * the order it was given.
+   *
+   * Deliberately a promise-returning callback on a SYNCHRONOUS builder: the
+   * remote call happens in the async execute layer, and this builder stays a
+   * pure function of (args, schemas, options, ranking). Disabled, failed, or
+   * absent rerank ⇒ `undefined` ⇒ the given order, i.e. pre-seam behavior.
+   */
+  rankQuery?: (query: string, candidates: readonly RankCandidate[]) => Promise<readonly string[] | undefined>
 }
 
 /** Normalized `mcp_list` arguments. */
@@ -812,6 +857,13 @@ export interface McpListArgs {
   server?: string
   /** Inline every tool's schema in the catalog. */
   verbose?: boolean
+  /**
+   * Free-text relevance query. Absent (or blank) = the unfiltered catalog,
+   * byte-identical to the pre-query behavior; present = a ranked SHORTLIST
+   * plus the total match count, never a silent narrowing of the only
+   * discovery path the model has.
+   */
+  query?: string
 }
 
 /** One catalog entry; `parameters` is present only when expanded. */
@@ -827,15 +879,67 @@ export interface CatalogServerEntry {
   tools: CatalogToolEntry[]
 }
 
-/** `mcp_list`'s canonical result: catalog, single expansion, or error. */
+/**
+ * `mcp_list`'s canonical result: catalog, single expansion, or error.
+ *
+ * The `{ servers }` variant carries four OPTIONAL keys that are present only
+ * on a query answer: `query`, `ranked`, `total` and `note`. They are what
+ * makes the subset self-describing — the model can see that this is a ranked
+ * shortlist of N of M matches and that the full catalog is one no-argument
+ * call away, and `ranked: false` says the prefilter matched nothing at all
+ * and this is the semantic fallback rather than a ranking. An unqueried
+ * catalog omits them entirely, so the wire value stays byte-identical to the
+ * pre-seam shape.
+ */
 export type McpListResult =
-  | { servers: CatalogServerEntry[] }
+  | {
+      servers: CatalogServerEntry[]
+      query?: string
+      ranked?: boolean
+      total?: number
+      note?: string
+    }
   | { tool: { name: string; description: string; parameters: Record<string, unknown> } }
   | { error: string }
 
 /**
+ * A precomputed ranking for one `{ query }` catalog call — the seam between
+ * the async jev layer and the pure builder. `pool`/`total` are the LEXICAL
+ * result (so the builder does not have to redo the work and cannot disagree
+ * with the shortlist jev was asked about); `order` is jev's permutation of
+ * that pool, absent when there is no opinion (fail-open ⇒ `pool` order).
+ */
+export interface ListRanking {
+  /** The query this ranking was computed for. */
+  query: string
+  /**
+   * The candidate set, at most {@link RANK_CANDIDATE_LIMIT} names: the lexical
+   * shortlist, best first — or, under {@link ListRanking.semantic}, the whole
+   * visible catalog in registry order.
+   */
+  pool: readonly string[]
+  /** Every lexical match, uncapped — the denominator of the `total` field. */
+  total: number
+  /** Reranked names, best first (production: the jev answer). */
+  order?: readonly string[]
+  /**
+   * True when the lexical prefilter matched NOTHING and `pool` is instead the
+   * SEMANTIC-FALLBACK set: the whole visible catalog, capped, handed to a
+   * reranker that can still tell a Chinese query from an English description
+   * and an ASCII one cannot. Absent (the ordinary case) = a lexical ranking,
+   * and the answer says `ranked: true` with no mention of a fallback.
+   */
+  semantic?: boolean
+}
+
+/**
  * Narrow arbitrary model arguments to the `mcp_list` shape, dropping
  * unknown or mistyped keys instead of throwing (the model misbehaves).
+ *
+ * A blank `query` is dropped rather than kept: an empty search is not a
+ * search, and honoring it would put the catalog on a different code path (the
+ * ranked one) for a request that means "show me everything".
+ *
  * @param args - raw model arguments.
  * @returns the normalized catalog query.
  */
@@ -846,6 +950,7 @@ export function normalizeMcpListArgs(args: unknown): McpListArgs {
     ...typeof raw.tool === 'string' ? { tool: raw.tool } : {},
     ...typeof raw.server === 'string' ? { server: raw.server } : {},
     ...raw.verbose === true ? { verbose: true } : {},
+    ...typeof raw.query === 'string' && raw.query.trim() !== '' ? { query: raw.query } : {},
   }
 }
 
@@ -888,17 +993,301 @@ export function truncateDescription(text: string, limit: number): string {
 }
 
 /**
+ * One catalog candidate between collection and rendering: the full description
+ * is what the rankers score (and what jev reads), the truncated one is what
+ * the catalog line shows. Keeping both is what lets the ranked path reuse the
+ * exact same collection loop as the plain path — one filter contract, one
+ * ordering contract, no second implementation to drift.
+ */
+interface CatalogCandidate {
+  readonly name: string
+  /** Full description — the lexical score's and jev's text. */
+  readonly description: string
+  /** `descriptionLimit`-truncated description — the catalog line's text. */
+  readonly shown: string
+  readonly parameters?: Record<string, unknown>
+}
+
+/**
+ * Collect the visible catalog candidates in registry order, applying the
+ * shared filter contract (never the meta-tools, prefix match, servers
+ * whitelist, gate) and an optional server filter. Disabled servers are
+ * reported separately instead of vanishing silently.
+ */
+function collectCatalogCandidates(
+  schemas: readonly ToolSchema[],
+  options: McpListOptions,
+  args: McpListArgs,
+  gate?: ServerGateState,
+): { candidates: CatalogCandidate[]; gatedAway: string[] } {
+  const { prefix, descriptionLimit } = options
+  const servers = options.servers ?? []
+  const candidates: CatalogCandidate[] = []
+  // Servers that passed prefix/whitelist checks but were hidden by the gate.
+  const gatedAway: string[] = []
+  for (const schema of schemas) {
+    // Never catalog the meta-tools themselves, even under a prefix that
+    // matches their names.
+    if (schema.name === MCP_LIST_TOOL_NAME || schema.name === MCP_CALL_TOOL_NAME) continue
+    if (!schema.name.startsWith(prefix)) continue
+    if (!isAllowedServer(schema.name, prefix, servers)) continue
+    const server = serverOfToolName(schema.name, prefix)
+    // Disabled servers vanish from the directory entirely; point-name
+    // expansion above remains the structured way to learn why.
+    if (isServerDisabled(server, gate)) {
+      if (!gatedAway.includes(server)) gatedAway.push(server)
+      continue
+    }
+    if (args.server !== undefined && server !== args.server) continue
+    candidates.push({
+      name: schema.name,
+      description: schema.description,
+      shown: truncateDescription(schema.description, descriptionLimit),
+      ...args.verbose === true ? { parameters: schema.parameters } : {},
+    })
+  }
+  return { candidates, gatedAway }
+}
+
+/** Group already-ordered candidates by server, first-seen order preserved. */
+function groupCatalogEntries(
+  candidates: readonly CatalogCandidate[],
+  prefix: string,
+): CatalogServerEntry[] {
+  const serversOut: CatalogServerEntry[] = []
+  for (const candidate of candidates) {
+    const server = serverOfToolName(candidate.name, prefix)
+    let group = serversOut.find(entry => entry.server === server)
+    if (group === undefined) {
+      group = { server, tools: [] }
+      serversOut.push(group)
+    }
+    group.tools.push({
+      name: candidate.name,
+      description: candidate.shown,
+      ...candidate.parameters === undefined ? {} : { parameters: candidate.parameters },
+    })
+  }
+  return serversOut
+}
+
+/**
+ * The structured error for a catalog that selected nothing — the gate-aware
+ * variants come first, so a fully-disabled deployment is never told "nothing
+ * is registered".
+ */
+function emptyCatalogError(
+  args: McpListArgs,
+  options: McpListOptions,
+  gate: ServerGateState | undefined,
+  gatedAway: readonly string[],
+): { error: string } {
+  if (args.server !== undefined && isServerDisabled(args.server, gate)) {
+    const id = gate?.serverIds[args.server]
+    return { error: `server "${args.server}" is disabled and hidden from the catalog — restore it with "/mcp enable ${String(id)}"` }
+  }
+  // An unfiltered catalog that found prefix tools but lost ALL of them to
+  // the gate must not claim "nothing is registered" (same facts as the
+  // filtered path above): name each hidden server with its restore hint.
+  if (args.server === undefined && gatedAway.length > 0) {
+    const named = gatedAway.map(name =>
+      `"${name}" ("/mcp enable ${String(gate?.serverIds[name])}")`).join(', ')
+    return { error: `every MCP tool under the "${options.prefix}" prefix belongs to a disabled server and is hidden from the catalog: ${named}` }
+  }
+  return args.server === undefined
+    ? { error: `no MCP tools are registered under the "${options.prefix}" prefix` }
+    : { error: `no MCP tools match server "${args.server}"` }
+}
+
+/**
+ * The SEMANTIC-FALLBACK pool: the whole visible catalog, capped at the jev
+ * batch size, in registry order.
+ *
+ * WHY IT EXISTS: an empty lexical pool does not mean "the catalog is empty",
+ * it means "no word of the query appeared in any name or description" — and
+ * that is the NORMAL outcome of a Chinese query against English MCP
+ * descriptions (context7/deepwiki/github all ship English blurbs), so the old
+ * `no MCP tool matches` error was a claim about a search that never ran.
+ * Handing the directory over instead lets a semantic reranker answer it, and
+ * lets a caller with no reranker show the catalog rather than assert a lie.
+ *
+ * One definition, shared by the exported prefilter and the ranked builder, so
+ * the two can never disagree about what the fallback set is.
+ */
+function semanticFallbackPool<T extends RankCandidate>(candidates: readonly T[]): T[] {
+  return candidates.slice(0, RANK_CANDIDATE_LIMIT)
+}
+
+/**
+ * Lexical shortlist over an ALREADY collected candidate set — the shared core
+ * of {@link listQueryRanking} and the ranked branch of
+ * {@link buildMcpListResult}, so the exported prefilter and the builder can
+ * never disagree about what "the query matches" means.
+ *
+ * An EMPTY lexical pool is a semantic fallback, not an error: the pool becomes
+ * {@link semanticFallbackPool} and `semantic` says so. The only error left
+ * here is a catalog that is genuinely empty (or fully gated) — the one case
+ * where "there is nothing to show" is a fact rather than a guess.
+ */
+function queryRankingFrom(
+  query: string,
+  args: McpListArgs,
+  options: McpListOptions,
+  gate: ServerGateState | undefined,
+  collected: { candidates: readonly CatalogCandidate[]; gatedAway: readonly string[] },
+): { pool: readonly RankCandidate[]; total: number; semantic?: boolean; error?: string } {
+  const { candidates, gatedAway } = collected
+  if (candidates.length === 0) {
+    return { pool: [], total: 0, error: emptyCatalogError(args, options, gate, gatedAway).error }
+  }
+  const matched = rankByQuery(query, candidates)
+  if (matched.length === 0) {
+    return { pool: semanticFallbackPool(candidates), total: candidates.length, semantic: true }
+  }
+  return { pool: matched.slice(0, RANK_CANDIDATE_LIMIT), total: matched.length }
+}
+
+/**
+ * The lexical relevance shortlist for one `query` catalog call — the pure,
+ * synchronous half of seam B. This is both what the jev reranker is asked
+ * about and the order that stands when jev is disabled or fails.
+ *
+ * @param args - the normalized catalog query (must carry a `query`).
+ * @param schemas - schemas visible to the calling agent.
+ * @param options - catalog knobs.
+ * @param gate - live disabled-server snapshot (default: none disabled).
+ * @returns the shortlist (name + full description per entry, so a reranker
+ *   can ask about them without re-reading the schemas) plus the uncapped
+ *   match count. A query the prefilter cannot lexically match comes back
+ *   `semantic` with the whole visible catalog as its pool. A structured error
+ *   means the catalog itself is empty or fully gated.
+ */
+export function listQueryRanking(
+  args: McpListArgs,
+  schemas: readonly ToolSchema[],
+  options: McpListOptions,
+  gate?: ServerGateState,
+): { pool: readonly RankCandidate[]; total: number; semantic?: boolean; error?: string } {
+  return queryRankingFrom(
+    args.query ?? '',
+    args,
+    options,
+    gate,
+    collectCatalogCandidates(schemas, options, args, gate),
+  )
+}
+
+/**
+ * The `note` a `{ query }` answer carries — the one line that tells the model
+ * what it is looking at.
+ *
+ * Two shapes, deliberately distinguishable: the LEXICAL one (frozen: existing
+ * sessions and the model's habits read it) and the SEMANTIC-FALLBACK one,
+ * which states out loud that nothing matched lexically and what the order it
+ * does have came from — so a plain directory can never be read as a ranked
+ * shortlist. Both name the no-argument catalog, the discovery path that is
+ * always there.
+ */
+function listQueryNote(
+  query: string,
+  shown: number,
+  total: number,
+  semantic: boolean,
+  reordered: boolean,
+): string {
+  const catalog = `call ${MCP_LIST_TOOL_NAME} with no arguments for the full catalog`
+  if (!semantic) {
+    return `ranked view for query "${query}": ${shown} of ${total} matching tool(s) — ${catalog}.`
+  }
+  const source = reordered
+    ? 'no lexical match, so the order is semantic relevance'
+    : 'no lexical match and no semantic rerank, so the order is the catalog registry order'
+  return `semantic fallback for query "${query}": ${shown} of ${total} visible tool(s) — ${source}; ${catalog}.`
+}
+
+/**
+ * The candidate set a `{ query }` answer is built from, resolved identically
+ * whether the async layer supplied a ranking or the builder recomputed it (a
+ * direct call in tests, or a ranking for a different query): the lexical
+ * shortlist when the prefilter matched anything, else the semantic-fallback
+ * set. Both branches read the same two functions `queryRankingFrom` does, so
+ * the two paths agree by construction.
+ */
+function queryView(
+  query: string,
+  candidates: readonly CatalogCandidate[],
+  effective: ListRanking | undefined,
+): { pool: readonly string[]; total: number; semantic: boolean } {
+  if (effective !== undefined) {
+    return { pool: effective.pool, total: effective.total, semantic: effective.semantic === true }
+  }
+  const matched = rankByQuery(query, candidates)
+  return matched.length > 0
+    ? { pool: matched.slice(0, RANK_CANDIDATE_LIMIT).map(candidate => candidate.name), total: matched.length, semantic: false }
+    : { pool: semanticFallbackPool(candidates).map(candidate => candidate.name), total: candidates.length, semantic: true }
+}
+
+/**
+ * The ranked catalog answer for one `query` call: a self-describing shortlist.
+ * `ranked`/`total`/`note` are the contract with the model — it must be
+ * impossible to mistake this for the whole catalog.
+ *
+ * `ranked` is the DISCRIMINATOR, not decoration: `true` means a lexical
+ * prefilter actually matched and this is a subset of the matches; `false`
+ * means the pool is the semantic fallback (no lexical match at all) and what
+ * is shown is a slice of the visible directory, in whatever order survived.
+ */
+function buildRankedCatalog(
+  query: string,
+  candidates: readonly CatalogCandidate[],
+  options: McpListOptions,
+  ranking: ListRanking | undefined,
+): McpListResult {
+  const effective = ranking !== undefined && ranking.query === query ? ranking : undefined
+  const view = queryView(query, candidates, effective)
+  const order = effective?.order
+  const byName = new Map(candidates.map(candidate => [candidate.name, candidate]))
+  const ordered = order === undefined ? view.pool : mergeNameOrder(view.pool, order)
+  const shown = ordered
+    .map(name => byName.get(name))
+    .filter((candidate): candidate is CatalogCandidate => candidate !== undefined)
+    .slice(0, LIST_RESULT_LIMIT)
+  return {
+    servers: groupCatalogEntries(shown, options.prefix),
+    query,
+    ranked: !view.semantic,
+    total: view.total,
+    // An EMPTY order is "no opinion", not an order that arrived — the note
+    // must not credit a rerank that returned nothing.
+    note: listQueryNote(query, shown.length, view.total, view.semantic, (order?.length ?? 0) > 0),
+  }
+}
+
+/**
  * Build the `mcp_list` result over the currently visible schemas.
  *
  * Priority: `tool` (full single-tool expansion) > catalog (optionally
- * filtered by `server`, optionally `verbose`). Unknown or non-MCP `tool`,
- * and any query that selects nothing, return a structured error — never a
- * throw — so the model can correct itself.
+ * filtered by `server`, optionally `verbose`, optionally ranked by `query`).
+ * Unknown or non-MCP `tool`, and any query that selects nothing out of an
+ * empty or fully gated catalog, return a structured error — never a throw —
+ * so the model can correct itself.
+ *
+ * A `query` that the LEXICAL prefilter cannot match is NOT an error: it
+ * degrades to the semantic fallback (the whole visible catalog, capped, and
+ * `ranked: false`), because "no word of the query appeared anywhere" is not
+ * "no tool matches" — see {@link semanticFallbackPool}.
+ *
+ * `query` is a MODEL-EXPLICIT narrowing: it is the only catalog path that
+ * consults `ranking` (production: the System One seam), and a missing/failed
+ * rerank degrades to the lexical order. With no `query`, this function is the
+ * pre-seim builder unchanged.
  *
  * @param args - the normalized catalog query.
  * @param schemas - schemas visible to the calling agent.
  * @param options - catalog knobs.
  * @param gate - live disabled-server snapshot (default: none disabled).
+ * @param ranking - precomputed relevance ranking for `args.query`
+ *   (production: the async layer's jev answer).
  * @returns the canonical result value.
  */
 export function buildMcpListResult(
@@ -906,8 +1295,9 @@ export function buildMcpListResult(
   schemas: readonly ToolSchema[],
   options: McpListOptions,
   gate?: ServerGateState,
+  ranking?: ListRanking,
 ): McpListResult {
-  const { prefix, descriptionLimit } = options
+  const { prefix } = options
   const servers = options.servers ?? []
   if (args.tool !== undefined) {
     // The meta-tools are visible schemas like any other and can match a
@@ -934,51 +1324,16 @@ export function buildMcpListResult(
     // On-demand expansion: the FULL description and schema, not truncated.
     return { tool: { name: schema.name, description: schema.description, parameters: schema.parameters } }
   }
-  const serversOut: CatalogServerEntry[] = []
-  // Servers that passed prefix/whitelist checks but were hidden by the gate.
-  const gatedAway: string[] = []
-  for (const schema of schemas) {
-    // Never catalog the meta-tools themselves, even under a prefix that
-    // matches their names.
-    if (schema.name === MCP_LIST_TOOL_NAME || schema.name === MCP_CALL_TOOL_NAME) continue
-    if (!schema.name.startsWith(prefix)) continue
-    if (!isAllowedServer(schema.name, prefix, servers)) continue
-    const server = serverOfToolName(schema.name, prefix)
-    // Disabled servers vanish from the directory entirely; point-name
-    // expansion above remains the structured way to learn why.
-    if (isServerDisabled(server, gate)) {
-      if (!gatedAway.includes(server)) gatedAway.push(server)
-      continue
-    }
-    if (args.server !== undefined && server !== args.server) continue
-    let group = serversOut.find(entry => entry.server === server)
-    if (group === undefined) {
-      group = { server, tools: [] }
-      serversOut.push(group)
-    }
-    group.tools.push({
-      name: schema.name,
-      description: truncateDescription(schema.description, descriptionLimit),
-      ...args.verbose === true ? { parameters: schema.parameters } : {},
-    })
+  const { candidates, gatedAway } = collectCatalogCandidates(schemas, options, args, gate)
+  // Model-explicit relevance search: a ranked SHORTLIST, self-describing
+  // through ranked/total/note. The only path that consults a ranking.
+  if (args.query !== undefined) {
+    const pre = queryRankingFrom(args.query, args, options, gate, { candidates, gatedAway })
+    if (pre.error !== undefined) return { error: pre.error }
+    return buildRankedCatalog(args.query, candidates, options, ranking)
   }
-  if (serversOut.length === 0) {
-    if (args.server !== undefined && isServerDisabled(args.server, gate)) {
-      const id = gate?.serverIds[args.server]
-      return { error: `server "${args.server}" is disabled and hidden from the catalog — restore it with "/mcp enable ${String(id)}"` }
-    }
-    // An unfiltered catalog that found prefix tools but lost ALL of them to
-    // the gate must not claim "nothing is registered" (same facts as the
-    // filtered path above): name each hidden server with its restore hint.
-    if (args.server === undefined && gatedAway.length > 0) {
-      const named = gatedAway.map(name =>
-        `"${name}" ("/mcp enable ${String(gate?.serverIds[name])}")`).join(', ')
-      return { error: `every MCP tool under the "${prefix}" prefix belongs to a disabled server and is hidden from the catalog: ${named}` }
-    }
-    return args.server === undefined
-      ? { error: `no MCP tools are registered under the "${prefix}" prefix` }
-      : { error: `no MCP tools match server "${args.server}"` }
-  }
+  const serversOut = groupCatalogEntries(candidates, prefix)
+  if (serversOut.length === 0) return emptyCatalogError(args, options, gate, gatedAway)
   return { servers: serversOut }
 }
 
@@ -990,6 +1345,112 @@ export interface DispatchableTool<E> {
   readonly timeoutMs?: number
   /** The tool body dispatch invokes. */
   execute(args: unknown, exec: E): Promise<unknown>
+}
+
+/**
+ * The near-miss seam of the unknown-tool branch (seam C).
+ *
+ * `candidates` is deliberately cheap and SYNCHRONOUS — it is called on a path
+ * the model is already reading an error on, and it must answer even when jev
+ * is off, timing out, or broken. `rerank` is the optional async refinement
+ * (production: the System One seam); `undefined`, a rejection, or an
+ * unusable answer all mean "keep the lexical order", which is the behavior
+ * the branch had before the seam existed.
+ */
+export interface DidYouMeanHook {
+  /** Visible tool names a near-miss may point at, in the calling scope. */
+  candidates(): readonly RankCandidate[]
+  /** Optional async reorder; absent/undefined/throw ⇒ lexical order stands. */
+  rerank?(tool: string, candidates: readonly RankCandidate[]): Promise<readonly string[] | undefined>
+}
+
+/** The near-miss pool cap — the same batch ceiling the jev seams use. */
+export const DID_YOU_MEAN_POOL_LIMIT = RANK_CANDIDATE_LIMIT
+
+/**
+ * The visible tools a near-miss may point at: this scope's prefix-matching
+ * MCP tools under the servers whitelist, minus the meta-tools and minus
+ * disabled servers (dispatch would refuse those anyway, so naming one would
+ * be advice the model cannot take).
+ *
+ * @param schemas - schemas visible to the calling agent.
+ * @param options - adapter knobs (prefix/servers).
+ * @param gate - live disabled-server snapshot (default: none disabled).
+ * @returns the pool, in registry order.
+ */
+export function didYouMeanPool(
+  schemas: readonly ToolSchema[],
+  options: Pick<McpCommandOptions, 'prefix' | 'servers'>,
+  gate?: ServerGateState,
+): RankCandidate[] {
+  const servers = options.servers ?? []
+  const pool: RankCandidate[] = []
+  for (const schema of schemas) {
+    if (schema.name === MCP_LIST_TOOL_NAME || schema.name === MCP_CALL_TOOL_NAME) continue
+    if (!schema.name.startsWith(options.prefix)) continue
+    if (!isAllowedServer(schema.name, options.prefix, servers)) continue
+    if (isServerDisabled(serverOfToolName(schema.name, options.prefix), gate)) continue
+    pool.push({ name: schema.name, description: schema.description })
+  }
+  return pool
+}
+
+/**
+ * The unknown-tool error value, with a did-you-mean suffix when the pool can
+ * offer one.
+ *
+ * The base sentence is the pre-seam message, byte for byte — the suggestion is
+ * strictly an addition, and it always names its own provenance (an unranked
+ * lexical guess must not read like a ranked one). Every seam failure path
+ * ends on that base sentence.
+ *
+ * @param tool - the unresolved tool name.
+ * @param prefix - the configured MCP prefix (excluded from shared-token
+ *   matching: every pool member carries it).
+ * @param hook - the near-miss seam, if the caller wired one.
+ * @returns the structured error value.
+ */
+async function unknownToolError(tool: string, prefix: string, hook: DidYouMeanHook | undefined): Promise<{ error: string }> {
+  const base = `tool "${tool}" is not registered or not visible in this scope — call ${MCP_LIST_TOOL_NAME} to see the catalog`
+  if (hook === undefined) return { error: base }
+  let pool: readonly RankCandidate[]
+  try {
+    pool = hook.candidates()
+  } catch {
+    return { error: base }
+  }
+  let candidates: readonly string[]
+  try {
+    // The fold prefix is excluded from the shared-token test: every candidate
+    // carries it, so it is not evidence of a near-miss.
+    candidates = didYouMeanCandidates(
+      tool,
+      pool.map(entry => entry.name),
+      DID_YOU_MEAN_POOL_LIMIT,
+      tokenize(prefix),
+    ).map(entry => entry.name)
+  } catch {
+    return { error: base }
+  }
+  if (candidates.length === 0) return { error: base }
+  let source: DidYouMeanSource = 'lexical'
+  // More than one near-miss is the only case where ranking can add anything;
+  // a single lexical hit needs no remote call at all.
+  if (candidates.length > 1 && hook.rerank !== undefined) {
+    try {
+      const order = await hook.rerank(tool, pool.filter(entry => candidates.includes(entry.name)))
+      // An answer that names nothing we asked about is not an opinion: the
+      // lexical order and its label stand.
+      const known = order === undefined ? [] : order.filter(name => candidates.includes(name))
+      if (known.length > 0) {
+        candidates = mergeNameOrder(candidates, known)
+        source = 'jev'
+      }
+    } catch {
+      // fail-open: the lexical order stands
+    }
+  }
+  return { error: base + didYouMeanMessage(candidates.slice(0, DID_YOU_MEAN_LIMIT), source) }
 }
 
 /**
@@ -1018,6 +1479,11 @@ export interface DispatchableTool<E> {
  * Errors never throw out of dispatch: a child rejection (or raced timeout)
  * is wrapped into a structured `{ error }` the model can correct and retry.
  *
+ * The unknown-tool branch additionally offers near-misses (seam C): a lexical
+ * prefilter over the scope's visible tools always answers, and an optional
+ * async rerank (production: System One) can reorder it. The base error text
+ * is unchanged, so this stays a pure addition to the message.
+ *
  * @param args - raw model arguments (`{ tool, arguments? }`, validated here).
  * @param prefix - the configured MCP prefix.
  * @param resolve - scope-aware tool resolver (production: `ctx.tools.get`).
@@ -1027,6 +1493,8 @@ export interface DispatchableTool<E> {
  *   disabled branch sits after the prefix/whitelist validation: a disabled
  *   server's tools are refused with an explicit `/mcp enable <id>` hint
  *   before the child is ever resolved.
+ * @param didYouMean - the near-miss seam for the unknown-tool branch
+ *   (default: none — the pre-seam message, unchanged).
  * @returns the child's resolved value verbatim, or a structured error.
  */
 export async function dispatchMcpCall<E>(
@@ -1036,6 +1504,7 @@ export async function dispatchMcpCall<E>(
   exec: E,
   servers: readonly string[] = [],
   gate?: ServerGateState,
+  didYouMean?: DidYouMeanHook,
 ): Promise<unknown> {
   if (typeof args !== 'object' || args === null || Array.isArray(args)) {
     return { error: `${MCP_CALL_TOOL_NAME} expects an object { "tool": string, "arguments"?: object }` }
@@ -1061,7 +1530,7 @@ export async function dispatchMcpCall<E>(
   }
   const definition = resolve(tool)
   if (definition === undefined) {
-    return { error: `tool "${tool}" is not registered or not visible in this scope — call ${MCP_LIST_TOOL_NAME} to see the catalog` }
+    return unknownToolError(tool, prefix, didYouMean)
   }
   try {
     // `?? {}` lets a missing/null arguments object reach the server, which
@@ -1127,11 +1596,43 @@ export interface McpCommandOptions {
    * one in the first place.
    */
   unassignedServers?: readonly string[]
+  /**
+   * The seven System One settings as plain data (production: the live
+   * volatile config refs, resolved per invocation). Absent ⇒ the views stay
+   * byte-identical to the pre-jev plugin — a caller that does not wire the
+   * decision support never sees a jev line.
+   */
+  jev?: McpJevOptions
+  /**
+   * Recorded usage counters for the views that talk about the suggestion
+   * cadence (production: the usage mirror). Absent ⇒ those views report "no
+   * usage recorded yet" instead of a number.
+   */
+  usage?: McpUsageOptions
+}
+
+/** The seven jev settings, flattened for display. */
+export interface McpJevOptions {
+  readonly jevEnabled: boolean
+  readonly jevBackend: string
+  readonly jevModel: string
+  readonly jevTimeoutMs: number
+  readonly jevSecretFile: string
+  readonly jevLayaFallback: boolean
+  readonly jevLayaUrl: string
+}
+
+/** Recorded-usage counters, flattened for display. */
+export interface McpUsageOptions {
+  /** Dispatches recorded across every tool. */
+  readonly totalCalls: number
+  /** Tools carrying at least one recorded call. */
+  readonly toolCount: number
 }
 
 /** Usage text returned for unparseable /mcp invocations. */
 export const MCP_COMMAND_USAGE = [
-  'Usage: /mcp [list [server|tool] | config | disable <id> | enable <id>]',
+  'Usage: /mcp [list [server|tool] | config | suggest | disable <id> | enable <id>]',
   '',
   '/mcp               tree of MCP servers and tools, plus folding health',
   '/mcp list          same as /mcp',
@@ -1140,6 +1641,8 @@ export const MCP_COMMAND_USAGE = [
   '                   server name or a full registered tool name)',
   '/mcp config        effective adapter configuration with per-pattern and',
   '                   per-server tool matches (read-only)',
+  '/mcp suggest       which folded tools recorded usage says are worth keeping',
+  '                   resident in every prompt (read-only; changes nothing)',
   '/mcp disable <id>  fold one server\'s tools out of every prompt until it is',
   '                   enabled again (<id> is the stable number shown by "/mcp";',
   '                   keep and servers exemptions included)',
@@ -1151,6 +1654,7 @@ export type ParsedMcpCommandInput =
   | { form: 'overview' }
   | { form: 'detail'; name: string }
   | { form: 'config' }
+  | { form: 'suggest' }
   | { form: 'disable'; id: number }
   | { form: 'enable'; id: number }
   | { form: 'usage' }
@@ -1163,9 +1667,10 @@ function parsePositiveInt(token: string): number | undefined {
 /**
  * Parse one /mcp raw input into its form. `''` and `'list'` are the tree
  * overview; `'list <name>'` is a server/tool detail; `'config'` shows the
- * effective configuration; `'disable <n>'` / `'enable <n>'` are whole-server
- * toggles (n is the stable id shown by `/mcp`, so a bare `0` or non-numeric
- * token is already usage). Everything else parses to the usage error.
+ * effective configuration; `'suggest'` shows the current keep suggestions;
+ * `'disable <n>'` / `'enable <n>'` are whole-server toggles (n is the stable id
+ * shown by `/mcp`, so a bare `0` or non-numeric token is already usage).
+ * Everything else parses to the usage error.
  * @param rawInput - exact text following the command name.
  * @returns the normalized command form.
  */
@@ -1180,6 +1685,8 @@ export function parseMcpCommandInput(rawInput: string): ParsedMcpCommandInput {
       return { form: 'usage' }
     case 'config':
       return parts.length === 1 ? { form: 'config' } : { form: 'usage' }
+    case 'suggest':
+      return parts.length === 1 ? { form: 'suggest' } : { form: 'usage' }
     case 'disable':
     case 'enable': {
       const id = parts.length === 2 ? parsePositiveInt(parts[1]) : undefined
@@ -1506,6 +2013,70 @@ export function renderMcpDetail(
 }
 
 /**
+ * Render the keep-suggestion view (`/mcp suggest`): the current batch of
+ * System One verdicts about which FOLDED tools earned a permanent place in
+ * every prompt, each with its probability, the usage evidence behind it, and
+ * the exact `keep` pattern the operator would write.
+ *
+ * Strictly a DISPLAY (red line ③): nothing here writes keep, prefix or the
+ * gate — the operator decides, one settings-page edit, with the same manual
+ * authority they have over every other knob.
+ *
+ * Every state is explained rather than blank: jev off, jev on with no batch
+ * yet, and jev on with rows. Output is line-capped defensively.
+ *
+ * @param suggestions - the current batch (production: suggestions.json).
+ * @param options - adapter knobs; `jev.jevEnabled` and `usage` are read.
+ * @returns the rendered view.
+ */
+export function renderMcpSuggest(
+  suggestions: readonly SuggestionRecord[],
+  options: Pick<McpCommandOptions, 'jev' | 'usage'>,
+): string {
+  const totalCalls = options.usage?.totalCalls ?? 0
+  const toolCount = options.usage?.toolCount ?? 0
+  const enabled = options.jev?.jevEnabled === true
+  const lines = ['keep suggestions — System One verdicts on folded tools (read-only)']
+  if (!enabled) {
+    lines.push(
+      '',
+      'decision support is OFF — set jevEnabled = true in the mcp-adapter settings to collect suggestions.',
+      'usage is still being recorded, so the first batch can run as soon as it is turned on.',
+    )
+  }
+  if (suggestions.length === 0) {
+    lines.push(
+      '',
+      `no suggestions yet — ${totalCalls} call(s) recorded, threshold is ${SUGGEST_BATCH_EVERY}`,
+      enabled
+        ? `a batch runs every ${SUGGEST_BATCH_EVERY} calls over the folded tools that were actually used`
+        : 'usage keeps accumulating while the switch is off',
+    )
+  } else {
+    const rows = [...suggestions].sort(
+      (left, right) => right.probability - left.probability || left.tool.localeCompare(right.tool),
+    )
+    const newest = rows.reduce((latest, row) => (row._at > latest ? row._at : latest), '')
+    lines.push('', `${rows.length} suggestion(s) from the last batch${newest === '' ? '' : ` (${newest})`}`)
+    for (const row of rows) {
+      lines.push(
+        '',
+        row.tool,
+        `  p=${row.probability.toFixed(2)} (${row.band})${row.basis === '' ? '' : ` — ${row.basis}`}`,
+        `  to keep it resident: ${keepSuggestionFragment(row.tool)}`,
+      )
+    }
+    lines.push(
+      '',
+      'bands: adopt = worth keeping resident, record = marginal, fallback = keep it folded.',
+      'display only — nothing was written to keep, prefix, or the server gate.',
+    )
+  }
+  lines.push('', `usage: ${totalCalls} call(s) across ${toolCount} tool(s); batch cadence ${SUGGEST_BATCH_EVERY} calls`)
+  return capRenderedLines(lines.join('\n'))
+}
+
+/**
  * Render the effective configuration with each knob's hitting tools:
  * which names match the prefix, what each keep pattern holds back, and what
  * each whitelisted server contributes. Read-only inventory, no mutations.
@@ -1570,6 +2141,28 @@ export function renderMcpConfig(schemas: readonly ToolSchema[], options: McpComm
     const idCapNotice = renderIdCapNotice(options.unassignedServers)
     if (idCapNotice !== undefined) lines.push('', idCapNotice)
   }
+  // System One decision support — only rendered when the caller wired it, so
+  // a pre-jev view stays byte-identical.
+  if (options.jev !== undefined) {
+    const jev = options.jev
+    lines.push(
+      '',
+      'System One decision support (hot-reloads from the settings page; every value is read per use):',
+      `  jevEnabled        ${jev.jevEnabled}${jev.jevEnabled ? '' : '   (off = no decision calls at all)'}`,
+      `  jevBackend        ${jev.jevBackend}`,
+      `  jevModel          ${jev.jevModel === '' ? '(backend default)' : jev.jevModel}`,
+      `  jevTimeoutMs      ${jev.jevTimeoutMs}`,
+      `  jevSecretFile     ${jev.jevSecretFile === '' ? '(none)' : jev.jevSecretFile}`,
+      `  jevLayaFallback   ${jev.jevLayaFallback}`,
+      `  jevLayaUrl        ${jev.jevLayaUrl === '' ? '(default)' : jev.jevLayaUrl}`,
+    )
+    if (options.usage !== undefined) {
+      lines.push(
+        `  recorded usage    ${options.usage.totalCalls} call(s) across ${options.usage.toolCount} tool(s)`,
+        `                    (keep-suggestion batches run every ${SUGGEST_BATCH_EVERY} calls — "/mcp suggest")`,
+      )
+    }
+  }
   return capRenderedLines(lines.join('\n'))
 }
 
@@ -1604,6 +2197,13 @@ export interface McpCommandView {
    * finishes in the background — same-process code cannot hard-kill it.
    */
   signal?: AbortSignal
+  /**
+   * The current keep-suggestion batch for `/mcp suggest` (production: read
+   * from `<gate dir>/suggestions.json` at invocation time). Absent ⇒ the view
+   * reports "no suggestions yet", which is also what a missing or unreadable
+   * document means.
+   */
+  suggestions?: readonly SuggestionRecord[]
 }
 
 /** CommandResult-compatible outcome (platform shape: success may omit text). */
@@ -1666,6 +2266,8 @@ export async function executeMcpCommand(view: McpCommandView): Promise<McpComman
     }
     case 'config':
       return { kind: 'success', text: renderMcpConfig(effectiveView.schemas, effectiveView.config) }
+    case 'suggest':
+      return { kind: 'success', text: renderMcpSuggest(effectiveView.suggestions ?? [], effectiveView.config) }
     case 'disable':
     case 'enable':
       return runServerToggle(parsed.form, parsed.id, registry, effectiveView)
@@ -1895,11 +2497,18 @@ export function delegateFinalizeContent(
 
 /**
  * Build the `mcp_list` meta-tool definition.
- * @param options - catalog knobs (prefix, description limit). MAY be a live
- *   options object (plain getters): the factory reads `prefix`, `servers`,
- *   `descriptionLimit` and `getGate` through the object on EVERY execution,
- *   so volatile config can be wired by reference — only the description text
- *   freezes at factory time.
+ *
+ * The execute layer is where the async seam lives: a no-argument call is the
+ * pre-seim builder verbatim (no promise, no remote), and only a `query` call
+ * consults `options.rankQuery` — and even then only AFTER a candidate pool
+ * exists, so a disabled/failed rerank changes the ORDER and nothing else.
+ *
+ * @param options - catalog knobs (prefix, description limit, optional
+ *   rankQuery). MAY be a live options object (plain getters): the factory
+ *   reads `prefix`, `servers`, `descriptionLimit`, `getGate` and
+ *   `rankQuery` through the object on EVERY execution, so volatile config can
+ *   be wired by reference — only the description text freezes at factory
+ *   time.
  * @param listSchemas - visible-schemas source (production: `ctx.tools.schemas`,
  *   called with the calling agent so restrictions are respected).
  * @returns the complete tool definition.
@@ -1916,6 +2525,7 @@ export function createMcpListTool(
       `With no arguments: a compact catalog grouped by server — full tool names (like "${prefix}<server>__<tool>") plus short descriptions.`,
       `Pass { "tool": "<full name>" } to expand that tool's complete input schema on demand.`,
       'Pass { "server": "<name>" } to filter the catalog to one server.',
+      'Pass { "query": "<what you want to do>" } to get a relevance-ranked shortlist of the tools that match a task — the answer says how many matched in total, and the unfiltered catalog is always one no-argument call away.',
       'Pass { "verbose": true } to inline every tool\'s full schema (expensive — request it only when you actually need many schemas).',
       `Workflow: call ${MCP_LIST_TOOL_NAME} to discover a tool and its schema, then invoke it with ${MCP_CALL_TOOL_NAME}.`,
     ].join(' '),
@@ -1924,34 +2534,98 @@ export function createMcpListTool(
       properties: {
         tool: { type: 'string', description: 'Full registered tool name whose schema to expand' },
         server: { type: 'string', description: 'Only list tools of this server' },
+        query: { type: 'string', description: 'Optional relevance search over names and descriptions; returns a ranked shortlist instead of the whole catalog' },
         verbose: { type: 'boolean', description: 'Inline every tool\'s full schema' },
       },
       additionalProperties: false,
     },
     output: {
       // Accepts every canonical result shape: { servers }, { tool }, { error }.
+      // The ranked subset adds query/ranked/total/note; they are absent from
+      // an unranked catalog, so `additionalProperties: false` still holds.
       schema: {
         type: 'object',
         properties: {
           servers: { type: 'array', items: {} },
           tool: {},
+          query: { type: 'string' },
+          ranked: { type: 'boolean' },
+          total: { type: 'number' },
+          note: { type: 'string' },
           error: { type: 'string' },
         },
         additionalProperties: false,
       },
       render: (_args: unknown, value: unknown) => renderValue(value),
     },
-    execute: (args: unknown, exec) => {
+    execute: async (args: unknown, exec) => {
       const query = normalizeMcpListArgs(args)
       // The calling agent's view: restricted-away tools stay out of the catalog.
       const schemas = listSchemas(exec.agent)
-      return Promise.resolve(buildMcpListResult(query, schemas, options, options.getGate?.()))
+      const gate = options.getGate?.()
+      // No query: the pre-seim path, byte-identical, and no jev call at all.
+      if (query.query === undefined) return buildMcpListResult(query, schemas, options, gate)
+      const pre = listQueryRanking(query, schemas, options, gate)
+      if (pre.error !== undefined) return { error: pre.error }
+      // Reranking is advisory: a missing hook, a disabled switch, a timeout, a
+      // bad answer — or a hook that throws outright — all leave `order`
+      // undefined, and the lexical order stands.
+      //
+      // The pool handed over is the LEXICAL shortlist when the prefilter found
+      // anything and the whole visible catalog when it found nothing (the
+      // `semantic` fallback) — one call either way, because a semantic
+      // reranker is the only thing that can bridge a Chinese query and an
+      // English description, and it is free to say "no opinion".
+      let order: readonly string[] | undefined
+      try {
+        order = await options.rankQuery?.(query.query, pre.pool)
+      } catch {
+        order = undefined
+      }
+      return buildMcpListResult(query, schemas, options, gate, {
+        query: query.query,
+        pool: pre.pool.map(candidate => candidate.name),
+        total: pre.total,
+        ...pre.semantic === true ? { semantic: true } : {},
+        ...order === undefined ? {} : { order },
+      })
     },
   }
 }
 
 /**
+ * Optional seams {@link createMcpCallTool} wires into mcp_call. All three are
+ * contained: a throwing hook degrades to the pre-seam behavior and never
+ * breaks a dispatch.
+ */
+export interface McpCallHooks {
+  /**
+   * Near-miss pool for the unknown-tool branch, resolved in the CALLING
+   * agent's scope (production: the scope's visible prefix tools). Absent ⇒
+   * the pre-seam error text, unchanged.
+   */
+  didYouMean?: (scope: ScopeKey | undefined) => readonly RankCandidate[]
+  /**
+   * Async rerank of that pool (production: System One). Resolving to
+   * `undefined` or rejecting keeps the lexical order.
+   */
+  didYouMeanRank?: (
+    scope: ScopeKey | undefined,
+    tool: string,
+    candidates: readonly RankCandidate[],
+  ) => Promise<readonly string[] | undefined>
+  /**
+   * Told about every finished dispatch, success and failure alike (production:
+   * the usage store). Receives `tool: undefined` for a call that never named
+   * one. Synchronous and best-effort: this is on the hot path, so it must not
+   * return a promise and must never be awaited.
+   */
+  onDispatched?: (event: { tool: string | undefined; error: boolean }) => void
+}
+
+/**
  * Build the `mcp_call` meta-tool definition.
+ *
  * @param prefix - the configured MCP prefix (dispatch boundary). A thunk is
  *   accepted so volatile config is re-read on every dispatch; a plain string
  *   freezes the boundary at factory time.
@@ -1963,6 +2637,7 @@ export function createMcpListTool(
  *   gate store's current mirror; default/omitted: nothing is disabled).
  *   Deliberately a callback — the definition object outlives any one gate
  *   snapshot and must observe later /mcp enable/disable writes.
+ * @param hooks - the usage/did-you-mean seams (default: none wired).
  * @returns the complete tool definition.
  */
 export function createMcpCallTool(
@@ -1970,6 +2645,7 @@ export function createMcpCallTool(
   resolve: (name: string, scope?: ScopeKey) => ToolDefinition | undefined,
   servers: readonly string[] | (() => readonly string[]) = [],
   getGate?: () => ServerGateState | undefined,
+  hooks?: McpCallHooks,
 ): ToolDefinition {
   const prefixNow = typeof prefix === 'function' ? prefix : () => prefix
   const serversNow = typeof servers === 'function' ? servers : () => servers
@@ -2000,8 +2676,44 @@ export function createMcpCallTool(
       render: (args: unknown, value: unknown) =>
         renderDispatched(args, value, name => resolve(name)),
     },
-    execute: (args: unknown, exec) =>
-      dispatchMcpCall(args, prefixNow(), name => resolve(name, exec.agent), exec, serversNow(), getGate?.()),
+    execute: async (args: unknown, exec) => {
+      // The near-miss hook is bound to the CALLING scope here, so dispatch
+      // stays scope-agnostic and the pool it ranks is exactly what the model
+      // could have called.
+      const pool = hooks?.didYouMean === undefined
+        ? undefined
+        : (): readonly RankCandidate[] => {
+            try {
+              return hooks.didYouMean?.(exec.agent) ?? []
+            } catch {
+              return []
+            }
+          }
+      const value = await dispatchMcpCall(
+        args,
+        prefixNow(),
+        name => resolve(name, exec.agent),
+        // exec is forwarded VERBATIM — same object identity, which is what the
+        // child's WeakMap projection lookup below depends on.
+        exec,
+        serversNow(),
+        getGate?.(),
+        pool === undefined ? undefined : {
+          candidates: pool,
+          ...hooks?.didYouMeanRank === undefined
+            ? {}
+            : { rerank: (tool, candidates) => hooks.didYouMeanRank?.(exec.agent, tool, candidates) ?? Promise.resolve(undefined) },
+        },
+      )
+      if (hooks?.onDispatched !== undefined) {
+        try {
+          hooks.onDispatched({ tool: childToolName(args), error: isStructuredError(value) })
+        } catch {
+          // contained — telemetry never breaks a dispatch
+        }
+      }
+      return value
+    },
     // Restore child-owned projections (image attachments): the registry
     // invokes THIS definition's finalizer, so it must forward to the child's
     // with the same exec object dispatch passed to child.execute.
@@ -2026,11 +2738,19 @@ export function createMcpCallTool(
  * unreadable document degrades to the empty gate (everything enabled) at
  * load time, keeping the assemble waterfall alive.
  *
- * Config volatility: every knob (prefix/keep/servers/descriptionLimit) is a
- * volatile reference — 0.1.7 settings-page writes swap values in place
- * WITHOUT remounting the plugin, so nothing captured at apply time may go
- * stale: the waterfall, both meta-tools and the /mcp command all re-read
- * through {@link cfgNow} per use.
+ * Config volatility: every knob (prefix/keep/servers/descriptionLimit AND the
+ * seven jev* keys) is a volatile reference — 0.1.7 settings-page writes swap
+ * values in place WITHOUT remounting the plugin, so nothing captured at apply
+ * time may go stale: the waterfall, both meta-tools and the /mcp command all
+ * re-read through {@link cfgNow} / {@link jevEnv} per use.
+ *
+ * System One wiring (the only remote calls in this plugin): the decision log,
+ * the usage mirror and the suggestion document all live in the SAME gate
+ * directory as gate.json. The seams are wired to exactly three places — the
+ * background keep-suggestion batch ({@link maybeSuggestBatch}, fired by the
+ * usage counter and awaited by nobody), `mcp_list`'s model-explicit `query`,
+ * and `mcp_call`'s unknown-tool branch. Folding, an unqueried catalog, and a
+ * successful dispatch touch none of them.
  *
  * Commands: `/mcp` mounts through a runtime `ctx.inject(['commands'], ...)`,
  * so hosts without the commands service keep this plugin fully functional —
@@ -2055,12 +2775,99 @@ export function apply(ctx: Context, config: AdapterConfig): void {
   // takes effect on the next plugin restart. On a fresh gate (no gate.json)
   // the store absorbs the pre-0.1.7 `mcp-adapter:` settings state once —
   // fully contained, audit marker under storages/mcp-adapter.
-  const store = createFileGateStore(resolveGateDir(config.storageDir.get()), message => ctx.logger.warn(message), {
+  const gateDir = resolveGateDir(config.storageDir.get())
+  const warn = (message: string): void => ctx.logger.warn(message)
+  const store = createFileGateStore(gateDir, warn, {
     info: message => ctx.logger.info?.(message),
     home: resolveDshHome(),
   })
   const getGate = (): ServerGateState => store.get()
   const writeGate = (next: ServerIdRegistry): Promise<void> => store.write(next)
+
+  // ---- System One (jev) ----
+  //
+  // Three durable artifacts, one directory: decisions.jsonl (telemetry, one
+  // row per call INCLUDING failures), usage.json (per-tool counters, the
+  // input to the suggestion batch) and suggestions.json (the last batch, the
+  // thing /mcp suggest renders). All three degrade to "no data" rather than
+  // to an error.
+  const usage: UsageStore = createUsageStore(gateDir, warn)
+  const decisionLog = createDecisionLog(gateDir)
+  // Every value is read per call: turning jevEnabled on in the settings page
+  // takes effect on the very next dispatch, with no restart.
+  const jevEnv: JevRuntime = {
+    enabled: () => config.jevEnabled.get() === true,
+    config: () => ({
+      jevBackend: config.jevBackend.get(),
+      jevModel: config.jevModel.get(),
+      jevTimeoutMs: config.jevTimeoutMs.get(),
+      jevSecretFile: config.jevSecretFile.get(),
+      jevLayaFallback: config.jevLayaFallback.get() === true,
+      jevLayaUrl: config.jevLayaUrl.get(),
+    }),
+    log: () => decisionLog,
+  }
+  const jevNow = (): McpJevOptions => ({
+    jevEnabled: jevEnv.enabled(),
+    jevBackend: config.jevBackend.get(),
+    jevModel: config.jevModel.get(),
+    jevTimeoutMs: config.jevTimeoutMs.get(),
+    jevSecretFile: config.jevSecretFile.get(),
+    jevLayaFallback: config.jevLayaFallback.get() === true,
+    jevLayaUrl: config.jevLayaUrl.get(),
+  })
+  const usageNow = (): McpUsageOptions => ({
+    totalCalls: usage.total(),
+    toolCount: usageToolCount(usage.get()),
+  })
+
+  /**
+   * The lazy keep-suggestion batch (seam A). Fired from the usage hook on
+   * every multiple of {@link SUGGEST_BATCH_EVERY} total calls, with jev
+   * enabled. Strictly fire-and-forget: the dispatch that crossed the
+   * threshold returns before any of this runs, and nothing here can fail it.
+   *
+   * The in-flight guard drops a crossing that lands while a batch is still
+   * running — deliberately: the next crossing re-asks with fresher stats, and
+   * overlapping batches would spend the same remote budget twice for the same
+   * question.
+   */
+  let suggestInFlight = false
+  let suggestWarned = false
+  function maybeSuggestBatch(totalCalls: number): void {
+    try {
+      if (suggestInFlight || !shouldRunSuggestBatch(totalCalls) || !jevEnv.enabled()) return
+      const { prefix, keep, servers } = cfgNow()
+      const candidates = usageSuggestCandidates(
+        usage.get(),
+        ctx.tools.schemas(),
+        name => shouldFold(name, prefix, keep, servers, getGate()),
+      )
+      if (candidates.length === 0) return
+      suggestInFlight = true
+      const run = (async (): Promise<void> => {
+        try {
+          const records = await askKeepSuggestions(candidates, jevEnv)
+          // A failed round (jev down, bad answers) leaves the previous batch
+          // in place — the usage record is unaffected either way.
+          if (records !== null) await writeSuggestions(gateDir, records)
+        } catch (error) {
+          if (!suggestWarned) {
+            suggestWarned = true
+            warn(
+              `mcp-adapter: the keep-suggestion batch could not be stored `
+              + `(${error instanceof Error ? error.message : String(error)}) — usage keeps recording`,
+            )
+          }
+        } finally {
+          suggestInFlight = false
+        }
+      })()
+      void run.catch(() => undefined)
+    } catch {
+      // contained — the batch is a background nicety, never a dispatch concern
+    }
+  }
 
   // Live options object: getters re-resolve volatile config per execution, so
   // catalog/dispatch immediately follow settings-page edits (the list tool's
@@ -2071,6 +2878,8 @@ export function apply(ctx: Context, config: AdapterConfig): void {
       get servers() { return cfgNow().servers },
       get descriptionLimit() { return cfgNow().descriptionLimit },
       getGate,
+      // Seam B: only ever reached for an explicit `query` call.
+      rankQuery: async (query, candidates) => rankListQuery(query, candidates, jevEnv),
     },
     scope => ctx.tools.schemas(scope),
   )
@@ -2079,6 +2888,17 @@ export function apply(ctx: Context, config: AdapterConfig): void {
     (name, scope) => ctx.tools.get(name, scope),
     () => cfgNow().servers,
     getGate,
+    {
+      // Seam C: the pool is the CALLING scope's visible tools, built per
+      // dispatch (restrictions and re-syncs are reflected immediately).
+      didYouMean: scope => didYouMeanPool(ctx.tools.schemas(scope), cfgNow(), getGate()),
+      didYouMeanRank: (_scope, tool, candidates) => rankDidYouMean(tool, candidates, jevEnv),
+      // Usage accounting: every finished dispatch, success and failure alike.
+      onDispatched: event => {
+        if (event.tool === undefined) return
+        maybeSuggestBatch(usage.record(event.tool, event.error))
+      },
+    },
   )
 
   const disposers: Array<() => void> = []
@@ -2135,8 +2955,8 @@ export function apply(ctx: Context, config: AdapterConfig): void {
         const commandDisposer = ccmds.commands.register({
           name: MCP_COMMAND_NAME,
           description: 'Show MCP status; disable/enable MCP servers',
-          input: { hint: '[list [server|tool] | config | disable <id> | enable <id>]' },
-          handler: invocation => {
+          input: { hint: '[list [server|tool] | config | suggest | disable <id> | enable <id>]' },
+          handler: async invocation => {
             // The receiving agent's restricted view; an absent agent degrades to
             // the global registry view (`schemas()` without scope).
             const scope = invocation.agent ?? undefined
@@ -2146,14 +2966,22 @@ export function apply(ctx: Context, config: AdapterConfig): void {
             // ONE snapshot per execution keeps config.gate and view.gate identical;
             // volatile knobs are re-read per invocation (live settings-page edits).
             const gate = getGate()
+            // The suggestion batch is read per invocation and ONLY for
+            // `/mcp suggest` (it is rewritten in the background). A failed
+            // read degrades to "no suggestions" — this is a display, it must
+            // never fail the command.
+            const suggestions = parseMcpCommandInput(invocation.rawInput).form === 'suggest'
+              ? await readSuggestions(gateDir, warn).catch(() => [] as SuggestionRecord[])
+              : []
             return executeMcpCommand({
               rawInput: invocation.rawInput,
               schemas,
-              config: { ...cfgNow(), gate },
+              config: { ...cfgNow(), gate, jev: jevNow(), usage: usageNow() },
               metaToolsLive,
               gate,
               signal: invocation.signal,
               writeGate,
+              suggestions,
             })
           },
         })
