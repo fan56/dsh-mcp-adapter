@@ -27,6 +27,10 @@ All notable changes to this project will be documented in this file.
 - 其余面核对零改动：dsh-tools `ToolDefinition` 仅新增可选 `projectContent`（加法）；连接层复用官方 dsh-mcp-client（SDK v2 上游消化）；`mcp__` 折叠与 `mcp_list`/`mcp_call` 元工具机制不变；未触碰 dsh-llm ContentBlock/ToolSchema（`ToolSchema` 仅加可选 `deferLoading`）、消息源 kind（本插件不创建消息）、dsh-scope/dsh-system-prompt 面。
 - Plugin Manager 展示元数据：新增 icon.svg 与 locale/{en,zh}.json（`meta.title`/`meta.description`，官方 readPluginMeta 约定），package.json 声明 `icon` 并将两者入包。
 
+### Fixed
+
+- **Fresh `npm install` of the published tarball resolves again** — the upstream 0.2.1-rc.1 companion wave (2026-10-16/17: `cordis-plugin-loader@1.0.6`, `schemastery@3.18.5`, both non-prerelease) floats into rc.2-based consumer trees via cordis's `^1.0.3` loader range and clashes with the exact `3.18.4`/`4.0.4` peers — npm ERESOLVE, the published package was uninstallable since 10-17. Peer ranges widen to `^4.0.4` / `^3.18.4` (devDeps stay pinned exact).
+
 ## [0.4.2] - 2026-09-11
 
 ### Changed
