@@ -9,6 +9,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Add Apache-2.0 LICENSE file (package.json previously declared MIT without license text)
+
 ## [0.7.1] - 2026-10-18
 
 ### Fixed
