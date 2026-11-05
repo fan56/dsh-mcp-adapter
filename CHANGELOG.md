@@ -22,7 +22,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed (CI)
 
-- publish.yml resolved the newest of `latest`/`next` with `sort -V`, the recorded trap comparator: it ranks `0.2.1-rc.2` ABOVE `0.2.1` and would let an older rc win once a stable lands on `latest`. Replaced with the same prerelease-aware node comparator ci.yml has used since the 0.2.1 migration (verified: `0.2.2-rc.1` > `0.2.1`, `0.2.1` > `0.2.1-rc.2`, `0.2.2` > `0.2.2-rc.1`). ci.yml already conformed — zero action.
+- publish.yml resolved the newest of `latest`/`next` with `sort -V`, the recorded trap comparator: it ranks `0.2.1-rc.2` ABOVE `0.2.1` and would let an older rc win once a stable lands on `latest`. Replaced with the same prerelease-aware node comparator ci.yml has used since the 0.2.1 migration (verified: `0.2.2-rc.1` > `0.2.1`, `0.2.1` > `0.2.1-rc.2`, `0.2.2` > `0.2.2-rc.1`). ci.yml already conformed — zero action. Review hardening follows the sibling repos: the rc segments compare NUMERICALLY per dot segment (`rc.10` > `rc.2` — the string compare would pick the OLDER rc once an index reaches two digits; latent only, `latest` has always been a stable).
 
 ### Tests
 
