@@ -48,6 +48,17 @@
  * broken adapter must never make MCP tools undiscoverable. Under Code Mode
  * the wire already collapses to `run_code`, so this plugin is a natural no-op.
  *
+ * Host posture (dsh 0.2.2-rc.1): tool declarations became provider-owned —
+ * the `system-prompt/assemble` waterfall now transforms a `PromptPresentation`
+ * (sections/contexts/variables only) and the host appends the provider-
+ * collected `tools` AFTER the waterfall. The fold seam is structurally gone
+ * there, so the waterfall listener feature-detects: presentations that carry
+ * `tools` (hosts up to 0.2.1-rc.x) fold exactly as before; tools-less
+ * presentations pass through untouched and `/mcp` reports folding as
+ * UNAVAILABLE instead of claiming savings that never happen. Meta-tools,
+ * catalog, dispatch, gating, and the command surface are unaffected — they
+ * live entirely in the tools service.
+ *
  * All decision logic is exported as pure functions; the only Cordis calls
  * live in {@link apply}.
  *
@@ -777,7 +788,11 @@ export interface FoldOptions {
 
 /**
  * Structural subset of `PromptAssembly` the folding operates on, so tests
- * can drive it without importing prompt-assembly types.
+ * can drive it without importing prompt-assembly types. Host posture: this
+ * is what the `system-prompt/assemble` waterfall carried up to 0.2.1-rc.x;
+ * dsh >= 0.2.2-rc.1 waterfalls a tools-less `PromptPresentation` (tool
+ * declarations are provider-owned and appended after the waterfall), so
+ * production feature-detects before handing an assembly here.
  */
 export interface AssemblyWithTools {
   sections: unknown[]
@@ -1733,11 +1748,23 @@ export function liveServerNames(
   return names
 }
 
-/** Three-state folding health of the /mcp overview footer. */
+/**
+ * Whether the host's assemble waterfall carries tool declarations — the fold
+ * seam. `'presentation'`: the waterfall sees `tools` (hosts up to 0.2.1-rc.x)
+ * and folding rewrites them. `'provider-owned'`: the host appends provider-
+ * collected declarations after the waterfall (dsh ≥ 0.2.2-rc.1) — folding is
+ * structurally unavailable. `'unknown'`: no assembly observed yet this
+ * process; views keep the historical (folding-capable) rendering until the
+ * first waterfall observation settles the question.
+ */
+export type FoldCarrier = 'unknown' | 'presentation' | 'provider-owned'
+
+/** Four-state folding health of the /mcp overview footer. */
 export type McpFoldingHealth =
   | { state: 'folding'; folded: number; kept: number; schemaChars: number }
   | { state: 'fail-open' }
   | { state: 'idle'; matched: number }
+  | { state: 'unavailable' }
 
 /** Which tools count toward which health bucket. */
 export interface McpHealthStats {
@@ -1757,21 +1784,28 @@ export interface McpHealthStats {
  *
  * Health semantics follow the waterfall: folding counts as ACTIVE only when
  * the meta-tools are live AND at least one tool actually folds. Live but
- * nothing to fold is the idle state; not-live is fail-open.
+ * nothing to fold is the idle state; not-live is fail-open. On a
+ * provider-owned host (dsh ≥ 0.2.2-rc.1, `foldCarrier` `'provider-owned'`)
+ * the waterfall cannot fold anything — the honest reading is UNAVAILABLE,
+ * never an ACTIVE count computed from schemas the host will not rewrite.
  *
  * @param schemas - schemas visible to the receiving agent.
  * @param options - adapter knobs (prefix/keep/servers) plus the live gate
  *   snapshot (`gate`) when a gate store is available.
  * @param metaToolsLive - whether both meta-tools resolve to this plugin's
  *   definitions in the receiving agent's scope.
+ * @param foldCarrier - the host's fold-seam posture (default `'unknown'`:
+ *   keep the historical rendering until an assembly settles it).
  * @returns the folding health plus the partition behind it.
  */
 export function collectMcpHealth(
   schemas: readonly ToolSchema[],
   options: McpCommandOptions,
   metaToolsLive: boolean,
+  foldCarrier: FoldCarrier = 'unknown',
 ): { stats: McpHealthStats; health: McpFoldingHealth } {
   if (!metaToolsLive) return { stats: { folded: [], kept: [] }, health: { state: 'fail-open' } }
+  if (foldCarrier === 'provider-owned') return { stats: { folded: [], kept: [] }, health: { state: 'unavailable' } }
   const servers = options.servers ?? []
   const folded: ToolSchema[] = []
   const kept: ToolSchema[] = []
@@ -1808,6 +1842,9 @@ export function renderMcpHealthLine(health: McpFoldingHealth): string {
           + ` · ~${health.schemaChars} chars of schema out of prompt`
     case 'fail-open':
       return 'folding INACTIVE (fail-open) — full schemas are passing through'
+    case 'unavailable':
+      return `folding UNAVAILABLE — this host keeps tool declarations provider-owned (dsh >= 0.2.2-rc.1); ` +
+        `${MCP_LIST_TOOL_NAME}/${MCP_CALL_TOOL_NAME} keep working, full schemas are passing through`
     case 'idle':
       return health.matched > 0
         ? `folding INACTIVE (nothing folded) — ${health.matched} matching tool(s) stay native via keep/servers exemptions`
@@ -1904,12 +1941,14 @@ export function renderIdCapNotice(unassigned?: readonly string[]): string | unde
  * @param options - adapter knobs (prefix/keep/servers/descriptionLimit/gate/
  *   unassignedServers).
  * @param metaToolsLive - whether both meta-tools are live in that scope.
+ * @param foldCarrier - the host's fold-seam posture (default `'unknown'`).
  * @returns the complete overview text.
  */
 export function renderMcpOverview(
   schemas: readonly ToolSchema[],
   options: McpCommandOptions,
   metaToolsLive: boolean,
+  foldCarrier: FoldCarrier = 'unknown',
 ): string {
   const groups = groupSchemasByServer(schemas, options)
   const total = groups.reduce((sum, group) => sum + group.schemas.length, 0)
@@ -1926,7 +1965,7 @@ export function renderMcpOverview(
       lines.push(`${connector} ${schema.name}${description === '' ? '' : ` — ${description}`}`)
     })
   }
-  lines.push('', renderMcpHealthLine(collectMcpHealth(schemas, options, metaToolsLive).health))
+  lines.push('', renderMcpHealthLine(collectMcpHealth(schemas, options, metaToolsLive, foldCarrier).health))
   const idCapNotice = renderIdCapNotice(options.unassignedServers)
   if (idCapNotice !== undefined) lines.push(idCapNotice)
   return capRenderedLines(lines.join('\n'))
@@ -2179,6 +2218,15 @@ export interface McpCommandView {
   /** Whether both meta-tools resolve to this plugin's definitions there. */
   metaToolsLive: boolean
   /**
+   * The host's fold-seam posture observed by the assemble waterfall this
+   * process (production: the apply-time latch; default `'unknown'` keeps the
+   * historical folding-capable rendering until the first assembly settles
+   * it). A tools-less presentation means the host appends provider-owned
+   * declarations after the waterfall (dsh >= 0.2.2-rc.1): the overview
+   * footer reports UNAVAILABLE rather than counting folds that never happen.
+   */
+  foldCarrier?: FoldCarrier
+  /**
    * Gate snapshot resolved when the invocation started; `undefined` means no
    * gate store is available in this process (stable ids and toggles are
    * unavailable; views degrade to enabled-everything).
@@ -2259,7 +2307,7 @@ export async function executeMcpCommand(view: McpCommandView): Promise<McpComman
   }
   switch (parsed.form) {
     case 'overview':
-      return { kind: 'success', text: renderMcpOverview(effectiveView.schemas, effectiveView.config, effectiveView.metaToolsLive) }
+      return { kind: 'success', text: renderMcpOverview(effectiveView.schemas, effectiveView.config, effectiveView.metaToolsLive, view.foldCarrier) }
     case 'detail': {
       const rendered = renderMcpDetail(parsed.name, effectiveView.schemas, effectiveView.config)
       return { kind: rendered.outcome === 'unknown' ? 'error' : 'success', text: rendered.text }
@@ -2902,6 +2950,14 @@ export function apply(ctx: Context, config: AdapterConfig): void {
   )
 
   const disposers: Array<() => void> = []
+  // Fold-seam posture of the running host, settled by the first observed
+  // assembly and read by the /mcp command handler: a presentation that
+  // carries `tools` is foldable (hosts up to 0.2.1-rc.x); a tools-less one
+  // means the host appends provider-owned declarations after the waterfall
+  // (dsh >= 0.2.2-rc.1) and folding is structurally unavailable. Until the
+  // first observation the latch stays 'unknown' and /mcp renders
+  // historically.
+  let foldCarrier: FoldCarrier = 'unknown'
   try {
     disposers.push(ctx.tools.register(listDefinition))
     disposers.push(ctx.tools.register(callDefinition))
@@ -2931,7 +2987,24 @@ export function apply(ctx: Context, config: AdapterConfig): void {
     // Volatile knobs are re-read per assembly: settings-page edits reach the
     // next prompt without a plugin remount.
     const { prefix, keep, servers } = cfgNow()
-    return foldPromptAssembly(assembled, { prefix, keep, servers }, metaToolsLive, getGate())
+    // Host posture (dsh >= 0.2.2-rc.1): tool declarations are provider-owned.
+    // The waterfall transforms a PromptPresentation WITHOUT `tools` and the
+    // host appends the provider-collected list after this waterfall — the
+    // fold seam is structurally gone, so a tools-less presentation must pass
+    // through untouched (rewriting sections we do not own is never correct).
+    // The runtime shape check bridges both host lines from one build.
+    if (!Array.isArray((assembled as { tools?: unknown }).tools)) {
+      foldCarrier = 'provider-owned'
+      return assembled
+    }
+    foldCarrier = 'presentation'
+    const folded = foldPromptAssembly(assembled as unknown as AssemblyWithTools, { prefix, keep, servers }, metaToolsLive, getGate())
+    // Same-reference contract: foldPromptAssembly hands back the input
+    // object when it changes nothing — return the host's object itself in
+    // that case (the assertion is runtime-verified by the Array.isArray
+    // check above; a folded copy only ever adds/replaces `tools`).
+    if (folded === (assembled as unknown)) return assembled
+    return folded as unknown as typeof assembled
   })
 
   // Status + server toggles on the platform command service (visible in TUI
@@ -2978,6 +3051,7 @@ export function apply(ctx: Context, config: AdapterConfig): void {
               schemas,
               config: { ...cfgNow(), gate, jev: jevNow(), usage: usageNow() },
               metaToolsLive,
+              foldCarrier,
               gate,
               signal: invocation.signal,
               writeGate,

@@ -13,6 +13,21 @@ All notable changes to this project will be documented in this file.
 
 - Add Apache-2.0 LICENSE file (package.json previously declared MIT without license text)
 
+- **Ride the dsh 0.2.2-rc.1 host closure.** devDeps `@deepseek-ai/dsh-*` exact pins moved `0.2.1-rc.5` → `0.2.2-rc.1`; the dev-only `@deepseek-ai/cordis` pin moved `4.0.5` → `4.1.0` and `@deepseek-ai/schemastery` `3.18.4` → `3.19.0` (the 0.2.2-rc.1 closure ships those). Peer floors (`^4.0.4` / `^3.18.4` / `>=0.2.0-rc.2`) untouched — the closure's own `evaluatePluginCompatibility` returns PASS (no unmet requirement) for this manifest on runtime `0.2.2-rc.1`, and no `0.2.2`-only API is used.
+
+### Fixed
+
+- **dsh 0.2.2-rc.1 made tool declarations provider-owned — the prompt-fold seam moved out from under the plugin.** The `system-prompt/assemble` waterfall now transforms a tools-less `PromptPresentation` (sections/contexts/variables only); the host collects tool schemas from `systemPrompt.tools()` providers and appends them AFTER the waterfall, so a listener that rewrites `assembly.tools` cannot work there (and the previous code broke compile against the new `d.ts`, at runtime risking a TypeError on the missing `tools` property). The waterfall listener now feature-detects: presentations that carry `tools` (hosts up to 0.2.1-rc.x) fold exactly as before — same-reference passthrough preserved when nothing folds; tools-less presentations (dsh >= 0.2.2-rc.1) pass through untouched and the fold is reported honestly instead of silently dying. Meta-tools, catalog, dispatch, gating, usage, jev seams and `/mcp` are unaffected — they live entirely in the tools service.
+- `/mcp` folding health gains a fourth state: on a provider-owned host the overview footer now reads `folding UNAVAILABLE — this host keeps tool declarations provider-owned (dsh >= 0.2.2-rc.1); mcp_list/mcp_call keep working, full schemas are passing through` instead of `folding ACTIVE — folded N` computed from schemas the host never rewrites. Until the first waterfall observation in a process the historical rendering stands (unchanged for existing hosts).
+
+### Changed (CI)
+
+- publish.yml resolved the newest of `latest`/`next` with `sort -V`, the recorded trap comparator: it ranks `0.2.1-rc.2` ABOVE `0.2.1` and would let an older rc win once a stable lands on `latest`. Replaced with the same prerelease-aware node comparator ci.yml has used since the 0.2.1 migration (verified: `0.2.2-rc.1` > `0.2.1`, `0.2.1` > `0.2.1-rc.2`, `0.2.2` > `0.2.2-rc.1`). ci.yml already conformed — zero action.
+
+### Tests
+
+- +5: the tools-less waterfall passthrough (same-reference contract), the `unavailable` health state, its fail-open precedence, the byte-identical unknown-carrier rendering, and the UNAVAILABLE footer sentence. 317 tests pass / 0 fail against the 0.2.2-rc.1 closure; real-host boot smoke PASS on both host lines (`0.2.2-rc.1` scratch closure and the live `0.2.1-rc.5`).
+
 ## [0.7.1] - 2026-10-18
 
 ### Fixed

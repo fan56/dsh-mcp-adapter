@@ -645,6 +645,21 @@ test('apply(): registers both meta-tools and folds assemblies through the instal
   assert.deepEqual([...state.registered.keys()], ['mcp__fs__read_file'])
 })
 
+test('apply(): a tools-less presentation (dsh >= 0.2.2-rc.1 provider-owned host) passes through untouched', async () => {
+  const { ctx, state } = fakeCtx()
+  apply(ctx, runtimeConfig())
+  state.registered.set('mcp__fs__read_file', schema('mcp__fs__read_file'))
+  const listener = state.listeners.find(entry => entry.event === 'system-prompt/assemble').listener
+  // The 0.2.2-rc.1 PromptPresentation: sections/contexts/variables, NO `tools` —
+  // the host appends provider-collected declarations after the waterfall, so
+  // the fold seam is structurally gone. The listener must return the SAME
+  // reference (rewriting a presentation whose tools we cannot see is never
+  // correct) instead of throwing on the missing property.
+  const presentation = { sections: [], contexts: [], variables: {} }
+  const returned = await listener(presentation, { scope: undefined }, () => Promise.resolve(presentation))
+  assert.equal(returned, presentation)
+})
+
 test('apply(): meta-tool registration failure rolls back, warns, and installs no listener', () => {
   const { ctx, state } = fakeCtx({ failOn: MCP_CALL_TOOL_NAME })
   apply(ctx, runtimeConfig())

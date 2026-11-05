@@ -134,6 +134,25 @@ test('health: live but nothing matching is idle (zero-MCP-tools view)', () => {
   assert.deepEqual(allKept.health, { state: 'idle', matched: 1 })
 })
 
+test('health: provider-owned host reports UNAVAILABLE, never a count nothing will fold', () => {
+  // dsh >= 0.2.2-rc.1: the waterfall sees no `tools`, so folding cannot
+  // happen however many prefix matches the registry shows.
+  const { stats, health } = collectMcpHealth(mcpSchemas(), OPTIONS, true, 'provider-owned')
+  assert.deepEqual(health, { state: 'unavailable' })
+  assert.deepEqual(stats, { folded: [], kept: [] })
+})
+
+test('health: fail-open still wins over the provider-owned reading (actionable message first)', () => {
+  const { health } = collectMcpHealth(mcpSchemas(), OPTIONS, false, 'provider-owned')
+  assert.deepEqual(health, { state: 'fail-open' })
+})
+
+test('health: omitted/unknown carrier keeps the historical rendering byte-identical', () => {
+  const schemas = mcpSchemas()
+  assert.deepEqual(collectMcpHealth(schemas, OPTIONS, true), collectMcpHealth(schemas, OPTIONS, true, 'unknown'))
+  assert.deepEqual(collectMcpHealth(schemas, OPTIONS, true, 'presentation').health.state, 'folding')
+})
+
 // ---- renderMcpHealthLine ----
 
 test('health line: folding state renders the exact documented sentence', () => {
@@ -152,6 +171,14 @@ test('health line: fail-open replaces the whole line; idle explains the emptines
   )
   assert.match(renderMcpHealthLine({ state: 'idle', matched: 0 }), /no MCP tools match/)
   assert.match(renderMcpHealthLine({ state: 'idle', matched: 4 }), /4 matching tool\(s\) stay native/)
+})
+
+test('health line: unavailable names the provider-owned posture and the surviving surfaces', () => {
+  const line = renderMcpHealthLine({ state: 'unavailable' })
+  assert.match(line, /folding UNAVAILABLE/)
+  assert.match(line, /provider-owned/)
+  assert.match(line, /mcp_list\/mcp_call keep working/)
+  assert.match(line, /full schemas are passing through/)
 })
 
 // ---- groupSchemasByServer ----
