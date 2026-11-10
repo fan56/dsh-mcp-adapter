@@ -4,9 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    # Daily 03:39 UTC — catches upstream dsh drift without hand-pinning.
-    - cron: '39 3 * * *'
 
 permissions:
   contents: read
