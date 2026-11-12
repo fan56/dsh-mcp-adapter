@@ -11,6 +11,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Ride the dsh 0.2.2-rc.2 host closure.** devDeps `@deepseek-ai/dsh-*` exact pins moved `0.2.2-rc.1` → `0.2.2-rc.2` (lockfile advanced); the dev-only `@deepseek-ai/cordis` (`4.1.0`) and `@deepseek-ai/schemastery` (`3.19.0`) pins already match what the rc.2 closure ships (`~4.1.0` / `~3.19.0`) — zero action there. Peer floors (`^4.0.4` / `^3.18.4` / `>=0.2.0-rc.2`) untouched. ci.yml and publish.yml already resolve the host newest-of(latest/next) at runtime with the prerelease-aware node comparator — zero action. Mechanical dependency ride, no source changes.
+
 - Add Apache-2.0 LICENSE file (package.json previously declared MIT without license text)
 
 - **Ride the dsh 0.2.2-rc.1 host closure.** devDeps `@deepseek-ai/dsh-*` exact pins moved `0.2.1-rc.5` → `0.2.2-rc.1`; the dev-only `@deepseek-ai/cordis` pin moved `4.0.5` → `4.1.0` and `@deepseek-ai/schemastery` `3.18.4` → `3.19.0` (the 0.2.2-rc.1 closure ships those). Peer floors (`^4.0.4` / `^3.18.4` / `>=0.2.0-rc.2`) untouched — the closure's own `evaluatePluginCompatibility` returns PASS (no unmet requirement) for this manifest on runtime `0.2.2-rc.1`, and no `0.2.2`-only API is used.
@@ -27,6 +29,7 @@ All notable changes to this project will be documented in this file.
 ### Tests
 
 - +5: the tools-less waterfall passthrough (same-reference contract), the `unavailable` health state, its fail-open precedence, the byte-identical unknown-carrier rendering, and the UNAVAILABLE footer sentence. 317 tests pass / 0 fail against the 0.2.2-rc.1 closure; real-host boot smoke PASS on both host lines (`0.2.2-rc.1` scratch closure and the live `0.2.1-rc.5`).
+- rc.2 ride re-verification: 317 tests pass / 0 fail against the 0.2.2-rc.2 scratch closure; real-host boot smoke PASS on the scratch `0.2.2-rc.2` host (composed, 25s boot window survived, removal restored the stock tree).
 
 ## [0.7.1] - 2026-10-18
 
