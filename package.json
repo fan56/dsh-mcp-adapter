@@ -1,6 +1,6 @@
 {
   "name": "@aiwayds/dsh-mcp-adapter",
-  "version": "0.7.2",
+  "version": "0.8.1",
   "description": "dsh plugin: token-efficient prompt-side shim for the official MCP client — folds mcp__* tool schemas out of every assembled prompt and exposes two constant meta-tools (mcp_list / mcp_call) instead",
   "keywords": [
     "dsh",
@@ -29,7 +29,7 @@
   ],
   "scripts": {
     "link-closure": "node scripts/link-dsh-closure.mjs",
-    "postinstall": "node scripts/link-dsh-closure.mjs",
+    "prepare": "node scripts/link-dsh-closure.mjs",
     "build": "tsc -p tsconfig.json",
     "check": "tsc --noEmit -p tsconfig.json",
     "precheck": "node scripts/link-dsh-closure.mjs",

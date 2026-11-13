@@ -1,5 +1,5 @@
 /**
- * Postinstall linker: point every `node_modules/@deepseek-ai/*` entry at the
+ * Install-hook linker: point every `node_modules/@deepseek-ai/*` entry at the
  * global dsh closure.
  *
  * Why this exists: dsh-tui-pi is a plugin that runs *inside* the installed
@@ -17,7 +17,11 @@
  * (`Property 'settings' does not exist on type 'Context'`), so they must stay
  * *undeclared*. pnpm then treats the closure links as extraneous — and, as
  * it prunes entries it once managed, the links can still disappear after an
- * install. This script re-creates them on every `pnpm install` (postinstall).
+ * install. This script re-creates them on every root install (the `prepare`
+ * hook). It is deliberately NOT `postinstall`: pnpm 11 treats any dependency
+ * install hook as an unapproved build (strictDepBuilds) and fails the
+ * consumer's install, while `prepare` never runs for registry dependencies —
+ * so the published package carries no install hook at all.
  *
  * It is a no-op (exit 0) when no global dsh install is found — a dev machine
  * without dsh simply cannot typecheck against dsh types.
@@ -29,14 +33,25 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)))
-// Guard: this postinstall is a dev-machine convenience for THIS repo. A
-// published tarball carries scripts/ but no src/, and must never touch a
-// consumer's node_modules (it would delete their @deepseek-ai packages and
-// replace them with symlinks into their global dsh closure). pnpm ≥10 blocks
-// dependency lifecycle scripts by default, but npm would run this — exit
-// silently outside the repo.
+// Guard: this hook is a dev-machine convenience for THIS repo. A published
+// tarball carries scripts/ but no src/, and must never touch a consumer's
+// node_modules (it would delete their @deepseek-ai packages and replace them
+// with symlinks into their global dsh closure) — exit silently outside the
+// repo.
 if (!existsSync(join(repoRoot, 'src'))) {
   process.exit(0)
+}
+// Second guard: npm runs `prepare` inside a throwaway clone when installing a
+// git dependency, and a root project install in a subdirectory walks up to
+// this package with INIT_CWD elsewhere. Only a direct root install (INIT_CWD
+// = repoRoot, or unset for `node scripts/...`) may link.
+const initCwd = process.env.INIT_CWD
+if (initCwd !== undefined && initCwd !== '') {
+  try {
+    if (realpathSync(initCwd) !== realpathSync(repoRoot)) process.exit(0)
+  } catch {
+    process.exit(0)
+  }
 }
 const scopeDir = join(repoRoot, 'node_modules', '@deepseek-ai')
 

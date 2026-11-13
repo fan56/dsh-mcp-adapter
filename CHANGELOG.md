@@ -7,7 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - Every `@deepseek-ai` peer is now optional (`peerDependenciesMeta.optional: true`) — npm-class profile installs auto-resolve hard peers from the stable tower, and those exact-pinned copies shadow the host closure so the host pre-flight gate disables the plugin rows (the 10-26 cron 0.6.0 failure class, first seen 10-19). Surfaced by the new peer-meta audit in fan56/dsh-subagent-registry's weekly `e2e install`. No code change.
 
-## Unreleased
+## 0.8.1 (2026-11-13)
 
 ### Changed
 
@@ -19,6 +19,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **The published package no longer carries an install lifecycle hook — `postinstall` became `prepare` — so pnpm 11 updates stop failing with `ERR_PNPM_IGNORED_BUILDS` (see fan56/dsh-subagent-registry#10).** pnpm 11 defaults to `strictDepBuilds`: an install of a dependency declaring an unapproved `preinstall`/`install`/`postinstall` exits non-zero, and the dsh host plugin manager rolls the update back. npm and pnpm never run `prepare` for registry dependencies, and pnpm's gate set is exactly those three install hooks, so the published manifest is now hook-free while the dev closure linking keeps running from the root `prepare` hook (`npm run link-closure` stays the manual entry; CI's explicit `node scripts/link-dsh-closure.mjs` step is unaffected). `scripts/smoke-boot.mjs` also packs with `--ignore-scripts` so the hook's log line cannot corrupt the tarball filename it parses.
+- **The closure linker's stand-down guard also exits when `INIT_CWD` is set and is not the repo root** — npm runs `prepare` inside a throwaway clone when installing a git dependency, and a root install invoked from a subdirectory resolves here with an `INIT_CWD` elsewhere. `INIT_CWD` equal to the repo root (a normal root install) and an unset `INIT_CWD` (a direct `node scripts/link-dsh-closure.mjs` call) still link; a `realpathSync` failure exits 0.
 - **dsh 0.2.2-rc.1 made tool declarations provider-owned — the prompt-fold seam moved out from under the plugin.** The `system-prompt/assemble` waterfall now transforms a tools-less `PromptPresentation` (sections/contexts/variables only); the host collects tool schemas from `systemPrompt.tools()` providers and appends them AFTER the waterfall, so a listener that rewrites `assembly.tools` cannot work there (and the previous code broke compile against the new `d.ts`, at runtime risking a TypeError on the missing `tools` property). The waterfall listener now feature-detects: presentations that carry `tools` (hosts up to 0.2.1-rc.x) fold exactly as before — same-reference passthrough preserved when nothing folds; tools-less presentations (dsh >= 0.2.2-rc.1) pass through untouched and the fold is reported honestly instead of silently dying. Meta-tools, catalog, dispatch, gating, usage, jev seams and `/mcp` are unaffected — they live entirely in the tools service.
 - `/mcp` folding health gains a fourth state: on a provider-owned host the overview footer now reads `folding UNAVAILABLE — this host keeps tool declarations provider-owned (dsh >= 0.2.2-rc.1); mcp_list/mcp_call keep working, full schemas are passing through` instead of `folding ACTIVE — folded N` computed from schemas the host never rewrites. Until the first waterfall observation in a process the historical rendering stands (unchanged for existing hosts).
 

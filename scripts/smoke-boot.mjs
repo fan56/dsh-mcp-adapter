@@ -46,7 +46,9 @@ function fail(message, output = '') {
   process.exit(1)
 }
 
-const pack = spawnSync('npm', ['pack', '--pack-destination', work], { cwd: repoRoot, encoding: 'utf8' })
+// --ignore-scripts keeps the root `prepare` hook from writing to stdout and
+// corrupting the filename parsed below (the build gate already produced lib/).
+const pack = spawnSync('npm', ['pack', '--pack-destination', work, '--ignore-scripts'], { cwd: repoRoot, encoding: 'utf8' })
 if (pack.status !== 0 || pack.error) fail('npm pack failed', `${pack.stdout}\n${pack.stderr}`)
 const tarball = path.join(work, pack.stdout.trim().split('\n').at(-1))
 
